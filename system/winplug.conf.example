@@ -1,0 +1,13 @@
+# /etc/winplug/winplug.conf -- written by system/install.sh
+[winplug]
+# The desktop user who may use the bar plugin and the `winplug` command.
+user = CHANGEME
+# Omarchy's Windows VM container and compose file (defaults are Omarchy's).
+container = omarchy-windows
+compose = /var/lib/omarchy/windows/docker-compose.yml
+# QEMU USB controller to attach devices to; dockur creates "xhci".
+# If the bus is not found the device is attached to the default bus instead.
+usb_bus = xhci.0
+# Clear the setgid bit dockur leaves on an empty ~/Windows, which otherwise
+# makes `omarchy windows vm launch` fail on the next start.
+fix_home_modes = true

@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mechanicsunlocked.winplug",
+  "name": "Winplug",
+  "version": "0.1.0",
+  "author": "Sven Mathieu",
+  "license": "MIT",
+  "description": "Send USB devices to the Omarchy Windows VM from the bar, and take them back. Dongles, car and bike interfaces: hot-plug safe, native QEMU passthrough, no VM restart.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Winplug",
+    "description": "USB devices on this machine; click one to send it to Windows or take it back.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "socketPath": "/run/winplug/winplug.sock",
+      "hideWhenNoHelper": false
+    },
+    "schema": [
+      {
+        "key": "socketPath",
+        "type": "string",
+        "label": "Helper socket",
+        "defaultValue": "/run/winplug/winplug.sock"
+      },
+      {
+        "key": "hideWhenNoHelper",
+        "type": "boolean",
+        "label": "Hide the icon while the helper is not running",
+        "defaultValue": false
+      }
+    ]
+  }
+}

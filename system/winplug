@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""winplug -- send USB devices to the Omarchy Windows VM, from the terminal.
+
+  winplug list              devices on this machine and where they are
+  winplug add <device>      send a device to Windows (sticky: survives replugs
+                            and VM restarts until removed)
+  winplug remove <device>   take it back
+  winplug status            one line about the VM and the helper
+  winplug doctor            check the whole chain and say what is wrong
+  winplug watch             print state changes as they happen
+
+<device> is a vendor:product id (1a86:7523), the number from `winplug list`,
+or a unique part of the name.  --json on any command prints the raw state.
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+SOCKET = os.environ.get("WINPLUG_SOCKET", "/run/winplug/winplug.sock")
+
+STATUS_TEXT = {
+    "attached": "in Windows",
+    "attaching": "sending…",
+    "detaching": "removing…",
+    "waiting-vm": "will go to Windows when it runs",
+    "unplugged": "assigned, not plugged in",
+    "no-access": "blocked: restart Windows once",
+    "error": "error",
+    "available": "on Linux",
+}
+
+
+def die(msg, code=1):
+    print("winplug: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+class Client:
+    def __init__(self, path=SOCKET, timeout=5.0):
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.s.settimeout(timeout)
+        try:
+            self.s.connect(path)
+        except FileNotFoundError:
+            die("helper socket %s is missing.\n  Is winplugd installed and running?  sudo systemctl status winplugd" % path)
+        except PermissionError:
+            die("no permission on %s.\n  The helper is configured for another user; check /etc/winplug/winplug.conf" % path)
+        except ConnectionRefusedError:
+            die("winplugd is not running.  sudo systemctl start winplugd")
+        self.buf = b""
+        self.state = None
+
+    def read(self):
+        while b"\n" not in self.buf:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                die("helper closed the connection")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        msg = json.loads(line.decode())
+        if msg.get("type") == "state":
+            self.state = msg
+        return msg
+
+    def wait_state(self):
+        while self.state is None:
+            self.read()
+        return self.state
+
+    def request(self, **req):
+        self.s.sendall((json.dumps(req) + "\n").encode())
+        while True:
+            m = self.read()
+            if m.get("type") == "reply":
+                return m
+
+
+def find_device(state, what):
+    devs = state["devices"]
+    w = what.strip().lower()
+    for d in devs:
+        if d["key"] == w or d["key"].replace(":", "") == w.replace(":", ""):
+            return d
+    if w.isdigit():
+        i = int(w) - 1
+        if 0 <= i < len(devs):
+            return devs[i]
+        die("no device number %s (there are %d)" % (w, len(devs)))
+    matches = [d for d in devs if w in (d.get("name") or "").lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        die("no device matches %r; try `winplug list`" % what)
+    die("%r matches several devices: %s" % (what, ", ".join(d["key"] for d in matches)))
+
+
+def print_list(state):
+    devs = state["devices"]
+    print(state["vm"]["message"])
+    if not devs:
+        print("no USB devices")
+        return
+    w = max(len(d["name"]) for d in devs)
+    for i, d in enumerate(devs, 1):
+        where = STATUS_TEXT.get(d["status"], d["status"])
+        tags = ", ".join(d.get("tags") or [])
+        extra = []
+        if not d["present"]:
+            extra.append("not plugged in")
+        if tags:
+            extra.append(tags)
+        if d.get("count", 1) > 1:
+            extra.append("x%d" % d["count"])
+        if d.get("detail"):
+            extra.append(d["detail"])
+        print("%2d  %s  %-*s  %s%s" % (i, d["key"], w, d["name"], where,
+                                       ("  (" + "; ".join(extra) + ")") if extra else ""))
+
+
+def cmd_list(args):
+    c = Client()
+    st = c.wait_state()
+    if "--json" in args:
+        print(json.dumps(st, indent=2))
+    else:
+        print_list(st)
+
+
+def cmd_status(args):
+    c = Client()
+    st = c.wait_state()
+    if "--json" in args:
+        print(json.dumps(st["vm"], indent=2))
+        return
+    print("%s · %d assigned, %d in Windows · compose %s" % (
+        st["vm"]["message"], st["assigned_count"], st["attached_count"],
+        "has USB access" if st["vm"]["compose_patched"] else "NOT patched"))
+
+
+def cmd_change(args, cmd):
+    if not args:
+        die("which device?  `winplug list` shows them")
+    c = Client()
+    st = c.wait_state()
+    d = find_device(st, args[0])
+    r = c.request(cmd="attach" if cmd == "add" else "detach", key=d["key"], name=d.get("name"))
+    if not r.get("ok"):
+        die(r.get("error", "failed"))
+    # Give the helper a moment and report where the device ended up.
+    deadline = time.time() + 6
+    c.s.settimeout(1.0)
+    final = None
+    while time.time() < deadline:
+        try:
+            m = c.read()
+        except socket.timeout:
+            continue
+        if m.get("type") != "state":
+            continue
+        for e in m["devices"]:
+            if e["key"] == d["key"]:
+                final = e
+        if final and final["status"] in ("attached", "available", "waiting-vm", "unplugged", "no-access", "error"):
+            break
+    if final is None:
+        print("%s: %s" % (d["name"], "sent" if cmd == "add" else "removed"))
+    else:
+        print("%s: %s%s" % (d["name"], STATUS_TEXT.get(final["status"], final["status"]),
+                            (" -- " + final["detail"]) if final.get("detail") else ""))
+
+
+def cmd_watch(args):
+    c = Client(timeout=None)
+    while True:
+        m = c.read()
+        if m.get("type") == "state":
+            print(time.strftime("%H:%M:%S"), m["vm"]["message"])
+            for d in m["devices"]:
+                print("   ", d["key"], d["name"], "->", STATUS_TEXT.get(d["status"], d["status"]))
+
+
+def cmd_doctor(args):
+    ok = True
+    def check(cond, good, bad):
+        nonlocal ok
+        print(("  ok   " if cond else "  FAIL ") + (good if cond else bad))
+        ok = ok and bool(cond)
+
+    print("winplug doctor")
+    active = subprocess.run(["systemctl", "is-active", "winplugd"], capture_output=True, text=True).stdout.strip()
+    check(active == "active", "winplugd.service is running", "winplugd.service is %s  (sudo systemctl start winplugd; journalctl -u winplugd)" % (active or "missing"))
+    check(os.path.exists(SOCKET), "socket %s exists" % SOCKET, "socket %s missing" % SOCKET)
+    check(os.access(SOCKET, os.W_OK) if os.path.exists(SOCKET) else False,
+          "this user may use the socket", "this user cannot write the socket; the helper is configured for someone else")
+    if not os.path.exists(SOCKET) or not os.access(SOCKET, os.W_OK):
+        return 1
+    c = Client()
+    st = c.wait_state()
+    vm = st["vm"]
+    check(vm["installed"], "Windows VM is installed", "Windows VM not installed: omarchy windows vm install")
+    check(vm["compose_patched"], "compose has the USB bind mount and cgroup rule",
+          "compose not patched" + (" -- " + vm["message"] if "compose:" in vm["message"] else ""))
+    print("  info " + vm["message"])
+    if vm["status"] == "running-no-usb":
+        check(False, "", "the running VM has no /dev/bus/usb; stop and start Windows once")
+    elif vm["status"] == "running":
+        check(vm["usb_access"], "the running VM sees /dev/bus/usb", "the running VM has no /dev/bus/usb")
+    plug = os.path.expanduser("~/.config/omarchy/plugins/io.github.mechanicsunlocked.winplug/manifest.json")
+    check(os.path.exists(plug), "bar plugin installed", "bar plugin not installed: see README")
+    for d in st["devices"]:
+        if d["assigned"]:
+            print("  dev  %s %s: %s%s" % (d["key"], d["name"], STATUS_TEXT.get(d["status"], d["status"]),
+                                          (" -- " + d["detail"]) if d.get("detail") else ""))
+    return 0 if ok else 1
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd, args = argv[0], argv[1:]
+    if cmd in ("list", "ls"):
+        cmd_list(args)
+    elif cmd == "status":
+        cmd_status(args)
+    elif cmd in ("add", "send", "attach"):
+        cmd_change(args, "add")
+    elif cmd in ("remove", "rm", "detach"):
+        cmd_change(args, "remove")
+    elif cmd == "watch":
+        cmd_watch(args)
+    elif cmd == "doctor":
+        return cmd_doctor(args)
+    else:
+        die("unknown command %r; try `winplug help`" % cmd, 2)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]) or 0)
+    except KeyboardInterrupt:
+        sys.exit(130)

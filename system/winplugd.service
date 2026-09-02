@@ -1,0 +1,30 @@
+[Unit]
+Description=Winplug - USB passthrough helper for the Omarchy Windows VM
+Documentation=https://github.com/mechanicsunlocked/winplug
+After=docker.socket systemd-udevd.service
+Wants=docker.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/winplug/winplugd.py
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=winplug
+RuntimeDirectoryMode=0755
+StateDirectory=winplug
+# Root is needed: the QEMU monitor lives inside the container's mount
+# namespace, the compose file is root-owned, and Docker's socket is root-only
+# on Omarchy by design.  Everything else is locked down.
+ProtectSystem=false
+ProtectHome=false
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
