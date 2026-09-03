@@ -111,6 +111,12 @@ all do the same thing: start Windows if it is off, wait until it answers on
 RDP, open the session. Close the session and Windows shuts down, unless
 autostart is on or you passed `--keep-alive`.
 
+Only one session at a time. Windows (a client edition) allows one interactive
+session per account, so a second RDP connection as the same user is refused
+with "someone is already signed in". Open Windows again while it is already
+open — click the icon, or run `winplug launch` — and it just brings the
+existing window to the front instead of starting a rival connection.
+
 Two things about Omarchy's own launcher made this worth doing:
 
 **It asks for your password twice per session.** Omarchy elevates through

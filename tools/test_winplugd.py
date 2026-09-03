@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for the pure parts of winplugd (no root, no VM)."""
-import os, sys, tempfile, unittest, importlib.util, importlib.machinery, stat, socket, threading
+import os, sys, tempfile, unittest, importlib.util, importlib.machinery, stat, socket, threading, subprocess, time
 
 here = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("winplugd", os.path.join(here, "..", "system", "winplugd.py"))
@@ -229,6 +229,32 @@ class Rdp(unittest.TestCase):
         self.assertEqual(req[:4], b"\x03\x00\x00\x13")          # TPKT, length 19
         self.assertEqual(req[4], 14); self.assertEqual(req[5], 0xE0)   # X.224 CR
         self.assertEqual(req[11], 1)                            # RDP_NEG_REQ
+
+class SingleSession(unittest.TestCase):
+    def test_launch_lock_is_single_holder(self):
+        d = tempfile.mkdtemp()
+        os.environ["XDG_RUNTIME_DIR"] = d
+        cli._LAUNCH_LOCK_FD = None
+        fd1 = cli.acquire_launch_lock()
+        self.assertIsNotNone(fd1)
+        self.assertIsNone(cli.acquire_launch_lock())            # a second launch is blocked
+        os.close(fd1)                                           # first launch exits
+        fd2 = cli.acquire_launch_lock()                         # now free again
+        self.assertIsNotNone(fd2)
+        os.close(fd2)
+
+    def test_rdp_window_open_detects_a_client(self):
+        cli.RDP_HOST, cli.RDP_PORT = "127.0.0.1", 33899
+        self.assertFalse(cli.rdp_window_open())
+        # A stand-in whose argv looks like an xfreerdp connected to this VM.
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)",
+                              "xfreerdp3", "/v:127.0.0.1:33899"])
+        try:
+            seen = any(cli.rdp_window_open() or time.sleep(0.05) for _ in range(40))
+            self.assertTrue(seen)
+        finally:
+            p.terminate(); p.wait()
+        self.assertFalse(cli.rdp_window_open())
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

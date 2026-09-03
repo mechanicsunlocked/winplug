@@ -25,6 +25,7 @@ and send USB devices into it.
 or a unique part of the name.  --json on any command prints the raw state.
 """
 
+import fcntl
 import json
 import os
 import shutil
@@ -270,6 +271,70 @@ class Say:
             pass
 
 
+# Windows client editions allow one interactive session per user, so a second
+# RDP connection as the same account does not open a new window -- Windows
+# says "someone is already signed in, sign in as another user?" and the two
+# clients fight over the one session.  So launch is single-session: if a
+# window is already open (or one is being opened), bring it to the front
+# instead of starting a rival connection.
+
+_LAUNCH_LOCK_FD = None
+
+
+def launch_lock_path():
+    rt = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    return os.path.join(rt, "winplug-launch.lock")
+
+
+def acquire_launch_lock():
+    """Hold an exclusive lock for the life of this launch.  Returns the fd, or
+    None if another launch already holds it (one is mid-flight)."""
+    global _LAUNCH_LOCK_FD
+    try:
+        fd = os.open(launch_lock_path(), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    _LAUNCH_LOCK_FD = fd
+    return fd
+
+
+def rdp_window_open():
+    """True when some xfreerdp is already connected to this VM's RDP port."""
+    target = ("/v:%s:%d" % (RDP_HOST, RDP_PORT)).encode()
+    me = os.getpid()
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return False
+    for pid in pids:
+        if not pid.isdigit() or int(pid) == me:
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                cmd = f.read()
+        except OSError:
+            continue
+        if b"xfreerdp" in cmd and target in cmd:
+            return True
+    return False
+
+
+def focus_rdp_window():
+    """Raise the existing Windows window (Hyprland; a no-op elsewhere)."""
+    if not shutil.which("hyprctl"):
+        return
+    try:
+        subprocess.run(["hyprctl", "dispatch", "focuswindow", "title:" + RDP_TITLE],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except OSError:
+        pass
+
+
 def rdp_answers(timeout=2.0):
     """True when whatever sits at the RDP port completes an X.224 handshake."""
     try:
@@ -381,6 +446,17 @@ def cmd_launch(args):
     if not vm.get("launcher", True):
         die("the helper will not start Windows: omarchy-windows-vm is not a root-owned launcher (winplug doctor)")
     keep = keep or (bool(vm.get("autostart")) and not force_stop)
+
+    # Single-session: never open a second window onto the same VM.
+    if connect:
+        if rdp_window_open():
+            focus_rdp_window()
+            print("Windows is already open; brought it to the front.")
+            return 0
+        if acquire_launch_lock() is None:
+            focus_rdp_window()
+            print("Windows is already being opened.")
+            return 0
 
     if vm["status"] == "stopping":
         say("Windows is shutting down", "waiting for that to finish first")
