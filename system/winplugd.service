@@ -11,6 +11,11 @@ Restart=on-failure
 RestartSec=2
 RuntimeDirectory=winplug
 RuntimeDirectoryMode=0755
+# Keep /run/winplug across a service restart so the once-per-boot autostart
+# marker in it is not wiped by an on-failure restart or a reinstall; /run is
+# tmpfs, so it is still gone after a real reboot, which is what "once per
+# boot" means.
+RuntimeDirectoryPreserve=yes
 StateDirectory=winplug
 # Root is needed: the QEMU monitor lives inside the container's mount
 # namespace, the compose file is root-owned, and Docker's socket is root-only
