@@ -308,6 +308,18 @@ def parse_info_usb(text):
     return set(re.findall(r"ID:\s*(\S+)", text))
 
 
+def classify_docker_failure(stderr):
+    """Map a failed `docker inspect` to (status, error).  'no such object' is a
+    stopped/removed container -> off, not an error; Docker changed the casing
+    across versions (29 lower-cases it), so match case-insensitively."""
+    low = stderr.lower()
+    if "no such object" in low or "no such container" in low:
+        return "absent", ""
+    if "cannot connect" in low or "permission denied" in low or "is the docker daemon running" in low:
+        return "unknown", "docker daemon not running"
+    return "unknown", stderr.strip()[:200]
+
+
 # --------------------------------------------------------------------------
 # Container / VM tracking
 # --------------------------------------------------------------------------
@@ -386,13 +398,8 @@ class Vm:
             self.status, self.pid, self.error = "unknown", 0, "docker: %s" % e
             return
         if out.returncode != 0:
-            err = out.stderr.strip()
-            if "No such object" in err or "No such container" in err:
-                self.status, self.pid, self.error = "absent", 0, ""
-            elif "Cannot connect" in err or "permission denied" in err:
-                self.status, self.pid, self.error = "unknown", 0, "docker daemon not running"
-            else:
-                self.status, self.pid, self.error = "unknown", 0, err[:200]
+            self.status, self.error = classify_docker_failure(out.stderr)
+            self.pid = 0
             return
         self.error = ""
         try:

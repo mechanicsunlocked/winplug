@@ -81,6 +81,16 @@ class Hmp(unittest.TestCase):
         self.assertEqual(w.parse_info_usb(txt), {"usb-tablet", "winplug-1a86-7523"})
         self.assertEqual(w.parse_info_usb(""), set())
 
+    def test_classify_docker_failure(self):
+        # Docker 29 lower-cases this; older Docker capitalised it. Both = off.
+        self.assertEqual(w.classify_docker_failure("Error: no such object: omarchy-windows"), ("absent", ""))
+        self.assertEqual(w.classify_docker_failure("Error: No such object: omarchy-windows"), ("absent", ""))
+        self.assertEqual(w.classify_docker_failure("Error: No such container: omarchy-windows"), ("absent", ""))
+        self.assertEqual(w.classify_docker_failure("Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"),
+                         ("unknown", "docker daemon not running"))
+        self.assertEqual(w.classify_docker_failure("permission denied while trying to connect")[0], "unknown")
+        self.assertEqual(w.classify_docker_failure("weird failure")[1], "weird failure")
+
     def test_ids(self):
         self.assertEqual(w.qemu_id("1a86:7523"), "winplug-1a86-7523")
         self.assertEqual(w.Daemon.normalize_key("0x1A86:0X7523"), "1a86:7523")

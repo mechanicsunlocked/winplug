@@ -52,9 +52,9 @@ Panel {
   readonly property bool vmRunning: vmStatus === "running" || vmStatus === "running-no-usb"
   readonly property bool vmOff: vmStatus === "off"
   readonly property bool vmBusy: vmStatus === "starting" || vmStatus === "stopping"
-  // Start it when it is off, open the session when it runs; nothing while
-  // the helper is in the middle of a start or stop.
-  readonly property bool canLaunch: helperConnected && (vmOff || vmRunning)
+  // Offer the button whenever the VM is installed and not mid start/stop:
+  // "Open" when it is running, "Start" otherwise (off, or an odd Docker state).
+  readonly property bool canLaunch: helperConnected && vm && vm.installed === true && !vmBusy
   readonly property int attachedCount: helperState && helperState.attached_count ? helperState.attached_count : 0
   readonly property int assignedCount: helperState && helperState.assigned_count ? helperState.assigned_count : 0
 
@@ -97,22 +97,25 @@ Panel {
     onPathChanged: Qt.callLater(root.reconnect)
   }
 
-  // The helper may not be installed yet, or may restart; keep knocking.
+  // The helper may not be installed yet, or may restart (e.g. an upgrade);
+  // keep knocking until the socket answers again.
   Timer {
-    interval: 3000
+    interval: 2000
     repeat: true
     running: !sock.connected
     triggeredOnStart: true
     onTriggered: root.reconnect()
   }
 
-  // Quickshell keeps the *requested* state: after a failed attempt `connected`
-  // reads false but the target is still true, so setting true again is a
-  // no-op.  Drop the target first, then ask again.
+  // Quickshell keeps the *requested* connected state, and a synchronous
+  // false-then-true in one tick is coalesced, so the dial never restarts and
+  // a helper that was restarted is never picked back up.  Drop the request
+  // this event-loop turn, re-assert it the next, so the two writes are seen
+  // as a real transition.
   function reconnect() {
     if (sock.connected) return
     sock.connected = false
-    sock.connected = true
+    Qt.callLater(function() { if (!sock.connected) sock.connected = true })
   }
 
   function onLine(line) {
@@ -439,8 +442,8 @@ Panel {
         Component {
           id: startButton
           PanelActionButton {
-            iconText: root.vmOff ? "\uf011" : "\uf17a"
-            tooltipText: root.vmOff ? "Start Windows" : "Open Windows"
+            iconText: root.vmRunning ? "\uf17a" : "\uf011"
+            tooltipText: root.vmRunning ? "Open Windows" : "Start Windows"
             foreground: root.foreground
             hoverColor: root.foreground
             fontFamily: root.fontFamily
