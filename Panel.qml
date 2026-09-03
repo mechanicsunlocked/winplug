@@ -51,6 +51,10 @@ Panel {
   readonly property string vmStatus: vm ? String(vm.status) : ""
   readonly property bool vmRunning: vmStatus === "running" || vmStatus === "running-no-usb"
   readonly property bool vmOff: vmStatus === "off"
+  readonly property bool vmBusy: vmStatus === "starting" || vmStatus === "stopping"
+  // Start it when it is off, open the session when it runs; nothing while
+  // the helper is in the middle of a start or stop.
+  readonly property bool canLaunch: helperConnected && (vmOff || vmRunning)
   readonly property int attachedCount: helperState && helperState.attached_count ? helperState.attached_count : 0
   readonly property int assignedCount: helperState && helperState.assigned_count ? helperState.assigned_count : 0
 
@@ -158,9 +162,11 @@ Panel {
     else sendToWindows(d)
   }
 
-  // Omarchy's own launcher, exactly as its desktop entry runs it.
-  function startWindows() {
-    Quickshell.execDetached(["uwsm", "app", "--", "omarchy-windows-vm", "launch"])
+  // `winplug launch`: starts Windows through the helper (no password
+  // prompt), waits until it answers on RDP, then opens the session.  Run as
+  // an app through uwsm so it outlives this panel like any launched program.
+  function launchWindows() {
+    Quickshell.execDetached(["uwsm", "app", "--", "/usr/local/bin/winplug", "launch"])
   }
 
   // ---- words ----------------------------------------------------------------
@@ -402,7 +408,7 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onDeleteRequested: if (root.cursorActive) root.deleteSelected()
       onTextKey: function(t) {
-        if ((t === "s" || t === "S") && root.vmOff) root.startWindows()
+        if ((t === "s" || t === "S") && root.canLaunch) root.launchWindows()
         if (t === "r" || t === "R") root.request({ cmd: "state" })
       }
 
@@ -427,19 +433,19 @@ Panel {
               opacity: root.helperConnected ? 1.0 : 0.5
             }
           }
-          trailingControl: root.helperConnected && root.vmOff ? startButton : null
+          trailingControl: root.canLaunch ? startButton : null
         }
 
         Component {
           id: startButton
           PanelActionButton {
-            iconText: "\uf011"
-            tooltipText: "Start Windows"
+            iconText: root.vmOff ? "\uf011" : "\uf17a"
+            tooltipText: root.vmOff ? "Start Windows" : "Open Windows"
             foreground: root.foreground
             hoverColor: root.foreground
             fontFamily: root.fontFamily
             bordered: true
-            onClicked: root.startWindows()
+            onClicked: root.launchWindows()
           }
         }
 
@@ -526,7 +532,8 @@ Panel {
           visible: root.helperConnected && root.rows.length > 0
           text: root.vmRunning
             ? "Click a device to move it. Assigned devices follow every replug and every Windows start until you take them back."
-            : "Devices you send now go to Windows as soon as it starts."
+            : (root.vmBusy ? "Devices go to Windows as soon as it is up."
+                           : "Devices you send now go to Windows as soon as it starts.")
           color: root.dimmer
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

@@ -11,3 +11,11 @@ usb_bus = xhci.0
 # Clear the setgid bit dockur leaves on an empty ~/Windows, which otherwise
 # makes `omarchy windows vm launch` fail on the next start.
 fix_home_modes = true
+# Start Windows at boot, in the background (`winplug autostart on|off`).
+autostart = false
+# Seconds after the helper comes up before autostart brings Windows up.
+autostart_delay = 15
+# Omarchy's launcher.  The helper runs its privileged entry point for the
+# user above to start and stop Windows without a password prompt.  It must be
+# root-owned and writable by nobody else, or the helper will not touch it.
+vm_tool = /usr/bin/omarchy-windows-vm

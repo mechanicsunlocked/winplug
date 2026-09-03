@@ -11,6 +11,10 @@ until you take it back, and it goes through QEMU's own USB passthrough, so the
 device talks to Windows the way it would on real hardware: no RDP redirection,
 no USB/IP, no extra software in the guest.
 
+It also takes over starting Windows: no password prompts, the session opens
+once Windows actually answers, and Windows can start at boot if you want it
+always ready.
+
 Built for Omarchy 4's Windows VM (`omarchy windows vm`, which is
 [dockur/windows](https://github.com/dockur/windows) under the hood).
 
@@ -24,12 +28,15 @@ omarchy plugin add https://github.com/mechanicsunlocked/winplug.git --enable --y
 sudo ~/.config/omarchy/plugins/io.github.mechanicsunlocked.winplug/system/install.sh
 ```
 
-The first two lines put the widget in the bar, no root. The third installs
-`winplugd`, a small root service, and the `winplug` command. Root is needed
-because the VM's QEMU lives inside a root-owned container and Omarchy keeps
-you out of the docker group on purpose; the service is the narrow bridge
-across that, and it accepts exactly four commands (list, send, take back,
-check compose) from exactly one user.
+The first two lines put the widget in the bar and point the "Windows" app
+entry at `winplug launch`, no root. The third installs `winplugd`, a small
+root service, and the `winplug` command. Root is needed because the VM's QEMU
+lives inside a root-owned container and Omarchy keeps you out of the docker
+group on purpose; the service is the narrow bridge across that. It accepts a
+handful of commands (list, send, take back, check compose, start Windows,
+stop Windows, set autostart) from exactly one user, and nothing else.
+
+Add `--autostart` to the third line to have Windows start at boot.
 
 If Windows is running when you install, **stop it and start it once**. The
 service adds USB access to the VM's compose file, and that only takes effect
@@ -52,7 +59,8 @@ omarchy plugin remove io.github.mechanicsunlocked.winplug
 ```
 
 The root uninstall also takes the two USB lines back out of the compose file,
-so the Windows VM is exactly what Omarchy wrote.
+so the Windows VM is exactly what Omarchy wrote, and the user uninstall gives
+the "Windows" app entry back to Omarchy's launcher.
 
 ---
 
@@ -67,7 +75,7 @@ Click the icon. Two lists: **In Windows** and **On this machine**.
 | right-click a device in Windows | same as click: take it back |
 | `j` / `k`, `Enter` | keyboard: move, toggle |
 | `x` | take the highlighted device back |
-| `s` | start Windows, when it is off |
+| `s` | start Windows, or open the session when it is already running |
 
 The row tells you where things stand: *In Windows*, *Sending…*, *Goes to
 Windows when it starts*, *Not plugged in · still assigned*, or *Blocked ·
@@ -84,11 +92,55 @@ winplug remove ch341
 winplug status
 winplug doctor
 winplug watch             # print every change as it happens
+
+winplug launch            # start Windows if needed, open the session
+winplug vm start|stop     # without opening a session
+winplug autostart on|off  # start Windows at boot
 ```
 
 Devices that are part of the laptop (the Bluetooth radio, the camera) are
 listed too, marked as such. Passing the Bluetooth radio through is one way to
 get Bluetooth devices into Windows; that will be a proper feature later.
+
+---
+
+## Starting Windows
+
+"Windows" in the app launcher, the button in the panel and `winplug launch`
+all do the same thing: start Windows if it is off, wait until it answers on
+RDP, open the session. Close the session and Windows shuts down, unless
+autostart is on or you passed `--keep-alive`.
+
+Two things about Omarchy's own launcher made this worth doing:
+
+**It asks for your password twice per session.** Omarchy elevates through
+`pkexec` for every VM action, and the stock polkit policy does not remember
+the answer, so a launch prompts once to start Windows and again to stop it.
+Winplug's helper is root already; it runs Omarchy's own privileged entry
+point (`omarchy-windows-vm __priv up` and `down`) on your behalf, with all of
+Omarchy's mount and compose checks intact, and the prompt is gone. Omarchy's
+official alternative is "sudoless Docker", which puts you in the docker group
+(root-equivalent for anything running as you). Winplug's socket lets your
+processes start and stop the VM, and nothing more.
+
+**It connects before Windows is up.** Omarchy waits for the container to log
+"Windows started successfully", which dockur prints when the *firmware* hands
+over to the Windows boot manager, a good minute before Windows listens on
+RDP. The connection fails, Omarchy treats a closed session as "stop the VM",
+and you get a second password prompt for a shutdown you never asked for.
+`winplug launch` waits for a real RDP answer (an X.224 handshake, because
+Docker's port proxy accepts the TCP connection long before Windows does).
+
+If Windows ends the session itself (a reboot for updates, say), the launcher
+waits for it to come back and reopens the session. If the session was never
+made, Windows is left running and you are told why; it is never stopped
+behind your back.
+
+**Autostart.** `winplug autostart on` starts Windows at boot, in the
+background, and keeps it running when you close a session, so opening it is
+instant and a firmware flash is never one accidental window close away from a
+VM shutdown. Stop it from inside Windows or with `winplug vm stop`. Mind the
+RAM: the VM takes what Omarchy configured for it the moment it starts.
 
 ---
 
@@ -150,12 +202,13 @@ through. Two honest notes:
 ```
 Panel.qml              the bar widget and popup (Quickshell, Omarchy's UI kit)
 manifest.json          Omarchy plugin manifest
-install.sh             user half: enable the widget
-system/winplugd.py     root service: udev watch, QEMU monitor, compose patch
-system/winplug         CLI
-system/install.sh      root half: service, config, CLI
+install.sh             user half: enable the widget, point the Windows app entry at winplug
+system/winplugd.py     root service: udev watch, QEMU monitor, compose patch, VM start/stop
+system/winplug         CLI and launcher
+system/install.sh      root half: service, config, CLI (--autostart)
 system/uninstall.sh    root half removal, restores the compose
 tools/                 tests: unit tests and an end-to-end run against a fake QEMU monitor
+                       and a fake omarchy-windows-vm
 ```
 
 `winplugd` keeps its assignments in `/var/lib/winplug/state.json` and listens
@@ -175,8 +228,8 @@ to turn this off.)
 ## Tests
 
 ```bash
-python3 tools/test_winplugd.py    # compose patching, sysfs parsing, HMP parsing
-tools/test-daemon.sh              # the daemon against a fake QEMU monitor, as a normal user
+python3 tools/test_winplugd.py    # compose patching, sysfs and HMP parsing, launcher checks, RDP probe
+tools/test-daemon.sh              # the daemon against a fake QEMU monitor and a fake launcher, as a normal user
 ```
 
 ## License

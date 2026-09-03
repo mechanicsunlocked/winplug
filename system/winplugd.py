@@ -24,6 +24,14 @@ Runs as root (systemd), owns three jobs:
      That takes effect the next time the VM is started; until then the panel
      says so.
 
+  4. Start and stop the VM on request (and at boot, if asked to), without a
+     password prompt.  Omarchy's launcher elevates through pkexec for every
+     action, which prompts once to start and again to stop.  This daemon is
+     already root, so it runs Omarchy's own privileged entry point
+     (`omarchy-windows-vm __priv up|down`) on behalf of the configured user,
+     with all of Omarchy's mount and compose checks intact.  The user-owned
+     socket is the authorization boundary, the same one the USB commands use.
+
 Clients (the bar plugin, the `winplug` CLI) talk newline-delimited JSON over a
 unix socket that is owned by the configured user.  Every client receives the
 full state on connect and again whenever anything changes.
@@ -45,6 +53,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 
 log = logging.getLogger("winplugd")
@@ -63,6 +72,18 @@ REATTACH_AFTER_SECONDS = 7.0
 # has the device nodes points at the cgroup rule, i.e. the VM was started with
 # the old compose.
 NO_ACCESS_AFTER_SECONDS = 12.0
+# With every assigned device attached and no udev event, QEMU is asked this
+# often whether that is still so.  With nothing assigned at all the monitor is
+# left alone apart from a slow audit for leftovers of ours (a detach that
+# failed while the VM was unreachable, a daemon restart).  dockur's own boot
+# and shutdown handling use the same monitor, so the less it is shared, the
+# better.
+ATTACHED_POLL_SECONDS = 5.0
+IDLE_AUDIT_SECONDS = float(os.environ.get("WINPLUG_AUDIT_SECONDS", "60"))
+# How long the VM start / stop actions may run.  Start includes Omarchy's own
+# mount preparation and `docker compose up`; stop waits for the guest to power
+# down (Omarchy gives it two minutes).
+VM_JOB_TIMEOUT = {"up": 300, "down": 200}
 
 
 # --------------------------------------------------------------------------
@@ -81,11 +102,15 @@ class Config:
             "docker": "/usr/bin/docker",
             "usb_bus": "xhci.0",
             "fix_home_modes": "true",
+            "vm_tool": "/usr/bin/omarchy-windows-vm",
+            "autostart": "false",
+            "autostart_delay": "15",
         }})
         if os.path.exists(path):
             cp.read(path)
         s = cp["winplug"]
         env = os.environ.get
+        self.path = path
         self.user = env("WINPLUG_USER", s["user"])
         self.socket = env("WINPLUG_SOCKET", s["socket"])
         self.state = env("WINPLUG_STATE", s["state"])
@@ -94,11 +119,16 @@ class Config:
         self.docker = env("WINPLUG_DOCKER", s["docker"])
         self.usb_bus = env("WINPLUG_USB_BUS", s["usb_bus"])
         self.fix_home_modes = s.getboolean("fix_home_modes") and not env("WINPLUG_NO_HOME_FIX")
+        self.vm_tool = env("WINPLUG_VM_TOOL", s["vm_tool"])
+        self.autostart = s.getboolean("autostart") or bool(env("WINPLUG_AUTOSTART"))
+        self.autostart_delay = float(env("WINPLUG_AUTOSTART_DELAY", s["autostart_delay"]))
         # Test hooks.  None of these are read from the config file on purpose.
         self.sysfs = env("WINPLUG_SYSFS", "/sys/bus/usb/devices")
         self.monitor_override = env("WINPLUG_MONITOR")        # absolute HMP socket path
         self.container_pid_override = env("WINPLUG_CONTAINER_PID")
         self.no_udev = bool(env("WINPLUG_NO_UDEV"))
+        self.vm_runner = env("WINPLUG_VM_RUNNER", "systemd-run")   # "direct" in tests
+        self.trust_vm_tool = bool(env("WINPLUG_TRUST_VM_TOOL"))    # tests: user-owned fake tool
         self.uid = None
         self.gid = None
         self.home = None
@@ -397,6 +427,30 @@ class Vm:
         return os.path.exists("%s/%03d/%03d" % (self.usb_dir, d["bus"], d["dev"]))
 
 
+def tool_trusted(path):
+    """Only run a launcher that root wrote: a regular, root-owned file that
+    nobody else can write, in directories with the same property, up to /.
+    This is the check Omarchy's own launcher makes before handing a path to
+    pkexec; the daemon makes it before running the path as root."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022 or not st.st_mode & 0o111:
+        return False
+    probe = os.path.dirname(os.path.realpath(path))
+    while True:
+        try:
+            st = os.stat(probe)
+        except OSError:
+            return False
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            return False
+        if probe == "/":
+            return True
+        probe = os.path.dirname(probe)
+
+
 # --------------------------------------------------------------------------
 # Compose file patch
 # --------------------------------------------------------------------------
@@ -530,6 +584,18 @@ class Daemon:
         self.listener = None
         self.socket_id = None
         self.last_hmp_error = ""
+        self.udev_kick = False       # a USB event since the last monitor poll
+        self.last_poll = 0.0         # last `info usb`
+        self.audited_pid = 0         # container pid the leftover audit last ran for
+        self.pending_removal = set() # device_del that failed; retried when the VM is back
+        # VM start/stop: one job at a time, run by a worker thread, finished
+        # on the main thread through the wake pipe.
+        self.job = None
+        self.wake_r, self.wake_w = os.pipe()
+        os.set_blocking(self.wake_r, False)
+        self.launcher_ok = cfg.trust_vm_tool or tool_trusted(cfg.vm_tool)
+        self.autostart_at = 0.0
+        self.autostart_marker = os.path.join(os.path.dirname(cfg.socket), "autostarted")
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -541,12 +607,16 @@ class Daemon:
         signal.signal(signal.SIGINT, lambda *_: self.stop())
         log.info("winplugd ready on %s (container %s, user %s)",
                  self.cfg.socket, self.cfg.container, self.cfg.user or "-")
+        if not self.launcher_ok:
+            log.warning("%s is not a root-owned launcher; VM start/stop is disabled", self.cfg.vm_tool)
+        if self.cfg.autostart:
+            self.plan_autostart()
         next_tick = 0.0
         while self.running:
             now = time.monotonic()
             timeout = max(0.05, min(next_tick - now,
                                     (self.pending_reconcile_at - now) if self.pending_reconcile_at else 60))
-            rlist = [self.listener] + list(self.clients)
+            rlist = [self.listener, self.wake_r] + list(self.clients)
             if self.udev and self.udev.stdout:
                 rlist.append(self.udev.stdout)
             try:
@@ -561,6 +631,8 @@ class Daemon:
             for r in ready:
                 if r is self.listener:
                     self.accept()
+                elif r == self.wake_r:
+                    self.finish_job()
                 elif self.udev and r is self.udev.stdout:
                     self.read_udev()
                 else:
@@ -634,6 +706,7 @@ class Daemon:
             props = dict(l.split(b"=", 1) for l in block.split(b"\n") if b"=" in l)
             if props.get(b"DEVTYPE") == b"usb_device" and props.get(b"ACTION") in (b"add", b"remove", b"bind"):
                 # Give the kernel a moment to finish binding drivers, then look.
+                self.udev_kick = True
                 self.schedule_reconcile(0.4)
 
     def schedule_reconcile(self, delay):
@@ -737,12 +810,32 @@ class Daemon:
             self.store.save()
             self.status[key] = "detaching"
             err = self.qemu_remove(key)
+            if err:
+                # Try again whenever the VM is reachable, so nothing of ours
+                # lingers in the guest.
+                self.pending_removal.add(key)
             log.info("unassigned %s (%s)%s", key, was["name"] if was else "?", (" -- " + err) if err else "")
             reply(not err, err)
             self.tick()
         elif cmd == "ensure_compose":
             changed, err = self.check_compose(force=True)
             reply(not err, err, changed=changed)
+            self.broadcast_state(force=True)
+        elif cmd in ("vm_up", "vm_down"):
+            kind = cmd[3:]
+            self.vm._last_docker = 0.0
+            self.vm.refresh(time.monotonic())
+            if kind == "up" and not self.vm.installed:
+                return reply(False, "Windows VM is not installed (omarchy windows vm install)")
+            if kind == "up" and self.vm.status == "running":
+                return reply(True, already=True)
+            err = self.start_job(kind, c, rid)
+            if err:
+                reply(False, err)
+            # Otherwise the reply is sent when the job finishes.
+        elif cmd == "set_autostart":
+            err = self.write_autostart(bool(req.get("on")))
+            reply(not err, err, autostart=self.cfg.autostart)
             self.broadcast_state(force=True)
         elif cmd == "ping":
             reply(True)
@@ -757,10 +850,173 @@ class Daemon:
         m = re.fullmatch(r"(?:0x)?([0-9a-f]{4}):(?:0x)?([0-9a-f]{4})", key)
         return device_key(m.group(1), m.group(2)) if m else None
 
+    # -- starting and stopping the VM ------------------------------------------
+    #
+    # Omarchy's launcher does the privileged part of a start or stop in
+    # `omarchy-windows-vm __priv <action>`, run as root through pkexec with
+    # PKEXEC_UID naming the user it acts for.  This daemon is root already, so
+    # it runs the same entry point directly for the configured user: the same
+    # mount preparation, the same compose checks, the same `docker compose`
+    # calls, minus the password prompt.  The tool runs through systemd-run so
+    # that it lives in the host mount namespace (this service has a private
+    # one, and Omarchy's launcher bind-mounts the VM's data into place), with
+    # a clean environment and its own journal entries.
+
+    def job_argv(self, kind):
+        env_pairs = ["PKEXEC_UID=%d" % self.cfg.uid, "LANG=C.UTF-8", "LC_ALL=C.UTF-8", "HOME=/root",
+                     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+        tool = [self.cfg.vm_tool, "__priv", kind]
+        if self.cfg.vm_runner == "systemd-run":
+            unit = "winplug-vm-%s-%d" % (kind, int(time.time() * 1000) % 1000000000)
+            return (["systemd-run", "--quiet", "--collect", "--wait", "--pipe", "--unit=" + unit,
+                     "-p", "RuntimeMaxSec=%d" % VM_JOB_TIMEOUT[kind]]
+                    + ["--setenv=" + e for e in env_pairs] + ["--"] + tool)
+        return ["env", "-i"] + env_pairs + tool
+
+    def start_job(self, kind, c, rid):
+        """Start `omarchy-windows-vm __priv <kind>` in the background.  Returns
+        an error string, empty when the job is running."""
+        if self.job:
+            return "Windows is already being %s" % ("started" if self.job["kind"] == "up" else "stopped")
+        if not self.launcher_ok:
+            return "%s is not a root-owned launcher; refusing to run it as root" % self.cfg.vm_tool
+        if self.cfg.uid is None:
+            return "no user configured in winplug.conf"
+        argv = self.job_argv(kind)
+        job = {"kind": kind, "client": c, "rid": rid, "result": None, "started": time.monotonic()}
+        t = threading.Thread(target=self.run_job, args=(job, argv), daemon=True)
+        job["thread"] = t
+        self.job = job
+        t.start()
+        log.info("%s Windows: %s", "starting" if kind == "up" else "stopping", " ".join(argv[-3:]))
+        self.broadcast_state(force=True)
+        return ""
+
+    def run_job(self, job, argv):
+        """Worker thread: run the tool, park the result, wake the main loop."""
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                               timeout=VM_JOB_TIMEOUT[job["kind"]] + 30)
+            lines = [l for l in (p.stdout + "\n" + p.stderr).split("\n") if l.strip()]
+            job["result"] = (p.returncode == 0, "" if p.returncode == 0 else "\n".join(lines[-6:]), p.returncode)
+        except subprocess.TimeoutExpired:
+            job["result"] = (False, "timed out after %ds" % VM_JOB_TIMEOUT[job["kind"]], -1)
+        except OSError as e:
+            job["result"] = (False, str(e), -1)
+        try:
+            os.write(self.wake_w, b"x")
+        except OSError:
+            pass
+
+    def finish_job(self):
+        """Main thread, after the wake pipe fired: reply and refresh."""
+        try:
+            while os.read(self.wake_r, 64):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+        job = self.job
+        if not job or job["result"] is None:
+            return
+        self.job = None
+        ok, err, rc = job["result"]
+        verb = "start" if job["kind"] == "up" else "stop"
+        if ok:
+            log.info("Windows %s done", verb)
+        else:
+            log.warning("Windows %s failed (rc %s): %s", verb, rc, err or "no output")
+        self.vm._last_docker = 0.0
+        self.tick()
+        c = job["client"]
+        if c is not None and c in self.clients:
+            m = {"type": "reply", "cmd": "vm_" + job["kind"], "ok": ok}
+            if job["rid"] is not None:
+                m["id"] = job["rid"]
+            if not ok:
+                m["error"] = err or "%s failed (exit %s)" % (verb, rc)
+            self.send(c, m)
+        self.broadcast_state(force=True)
+
+    def plan_autostart(self):
+        """Once per boot: start the VM a little after the daemon comes up.  The
+        marker lives in the runtime directory, which is a tmpfs, so a daemon
+        restart later in the same boot does not start the VM again."""
+        if os.path.exists(self.autostart_marker):
+            log.info("autostart: already ran this boot")
+            return
+        if not self.launcher_ok:
+            log.warning("autostart: no trusted launcher; not starting Windows")
+            return
+        self.autostart_at = time.monotonic() + self.cfg.autostart_delay
+        log.info("autostart: Windows starts in %.0fs", self.cfg.autostart_delay)
+
+    def do_autostart(self):
+        try:
+            with open(self.autostart_marker, "w") as f:
+                f.write("%d\n" % time.time())
+        except OSError as e:
+            log.warning("autostart: cannot write %s: %s", self.autostart_marker, e)
+        self.vm._last_docker = 0.0
+        self.vm.refresh(time.monotonic())
+        if not self.vm.installed:
+            log.info("autostart: Windows VM is not installed; nothing to start")
+            return
+        if self.vm.status == "running":
+            log.info("autostart: Windows is already running")
+            return
+        err = self.start_job("up", None, None)
+        if err:
+            log.warning("autostart: %s", err)
+
+    def write_autostart(self, on):
+        """Flip `autostart` in the config file, keeping everything else."""
+        path = self.cfg.path
+        try:
+            if os.path.exists(path):
+                with open(path) as f:
+                    lines = f.read().split("\n")
+            else:
+                lines = ["[winplug]"]
+        except OSError as e:
+            return "cannot read %s: %s" % (path, e)
+        val = "autostart = %s" % ("true" if on else "false")
+        done = False
+        for i, l in enumerate(lines):
+            if re.match(r"\s*autostart\s*=", l):
+                lines[i] = val
+                done = True
+        if not done:
+            for i, l in enumerate(lines):
+                if l.strip() == "[winplug]":
+                    lines.insert(i + 1, val)
+                    done = True
+                    break
+        if not done:
+            lines = ["[winplug]", val] + lines
+        tmp = path + ".winplug.tmp"
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(tmp, "w") as f:
+                f.write("\n".join(lines).rstrip("\n") + "\n")
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+        except OSError as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return "cannot write %s: %s" % (path, e)
+        self.cfg.autostart = on
+        log.info("autostart %s", "on" if on else "off")
+        return ""
+
     # -- periodic work -----------------------------------------------------
 
     def tick(self):
         now = time.monotonic()
+        if self.autostart_at and now >= self.autostart_at:
+            self.autostart_at = 0.0
+            self.do_autostart()
         self.vm.refresh(now)
         if now - self.compose_checked > 10:
             self.compose_checked = now
@@ -828,6 +1084,32 @@ class Daemon:
             self.recreate.clear()
             return
 
+        # Removals that failed while the VM was unreachable.
+        for key in list(self.pending_removal):
+            if not self.qemu_remove(key):
+                self.pending_removal.discard(key)
+
+        # Is there anything to check?  Assigned devices that are plugged in
+        # want watching (closely until they are attached, then now and then);
+        # with nothing assigned the monitor is only audited once per VM start
+        # and slowly after that, for leftovers of ours.
+        active = [k for k in assigned if k in present]
+        settled = bool(active) and not self.recreate and all(self.status.get(k) == "attached" for k in active)
+        since_poll = now - self.last_poll
+        if vm.pid != self.audited_pid or self.udev_kick or self.recreate:
+            poll = True
+        elif active and not settled:
+            poll = True
+        elif settled:
+            poll = since_poll >= ATTACHED_POLL_SECONDS
+        else:
+            poll = since_poll >= IDLE_AUDIT_SECONDS
+        if not poll:
+            for key in assigned:
+                if key not in present:
+                    self.status[key] = "unplugged"
+            return
+
         try:
             attached = parse_info_usb(hmp(vm.monitor, "info usb"))
             self.last_hmp_error = ""
@@ -836,6 +1118,9 @@ class Daemon:
             for key in assigned:
                 self.status[key] = "waiting-vm"
             return
+        self.last_poll = now
+        self.audited_pid = vm.pid
+        self.udev_kick = False
 
         for key, info in assigned.items():
             qid = qemu_id(key)
@@ -903,7 +1188,8 @@ class Daemon:
                 key = qid[len(QEMU_ID_PREFIX):].replace("-", ":", 1)
                 if key not in assigned:
                     log.info("removing stale %s from the guest", qid)
-                    self.qemu_remove(key)
+                    if self.qemu_remove(key):
+                        self.pending_removal.add(key)
 
     def qemu_add(self, key, dev):
         """device_add; returns an error string, empty on success."""
@@ -969,6 +1255,10 @@ class Daemon:
 
         if not vm.installed:
             vstatus, message = "not-installed", "Windows VM is not installed (omarchy windows vm install)"
+        elif self.job and self.job["kind"] == "up":
+            vstatus, message = "starting", "Windows is starting"
+        elif self.job and self.job["kind"] == "down":
+            vstatus, message = "stopping", "Windows is shutting down"
         elif vm.status == "running":
             if vm.monitor:
                 if self.last_hmp_error:
@@ -995,6 +1285,9 @@ class Daemon:
                 "usb_access": (vm.usb_dir is not None) if vm.running else None,
                 "compose_patched": self.compose_patched,
                 "message": message,
+                "job": self.job["kind"] if self.job else "",
+                "autostart": bool(self.cfg.autostart),
+                "launcher": bool(self.launcher_ok),
             },
             "devices": devices,
             "assigned_count": len(self.store.assigned),

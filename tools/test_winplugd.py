@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Unit tests for the pure parts of winplugd (no root, no VM)."""
-import os, sys, tempfile, unittest, importlib.util, stat
+import os, sys, tempfile, unittest, importlib.util, importlib.machinery, stat, socket, threading
 
 here = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("winplugd", os.path.join(here, "..", "system", "winplugd.py"))
 w = importlib.util.module_from_spec(spec); spec.loader.exec_module(w)
+# The CLI has no .py suffix; load it by hand.
+_loader = importlib.machinery.SourceFileLoader("winplug_cli", os.path.join(here, "..", "system", "winplug"))
+cli = importlib.util.module_from_spec(importlib.util.spec_from_loader("winplug_cli", _loader)); _loader.exec_module(cli)
+w.log.setLevel(60)   # the tests provoke expected error logs (e.g. a config user that does not exist)
 
 OMARCHY_COMPOSE = """services:
   windows:
@@ -113,6 +117,118 @@ class Sysfs(unittest.TestCase):
         devs = w.enumerate_usb("/sys/bus/usb/devices")
         for e in devs.values():
             self.assertRegex(e["key"], r"^[0-9a-f]{4}:[0-9a-f]{4}$")
+
+class Launcher(unittest.TestCase):
+    def daemon(self, d, conf_text=None):
+        conf = os.path.join(d, "winplug.conf")
+        if conf_text is not None:
+            with open(conf, "w") as f:
+                f.write(conf_text)
+        os.environ["WINPLUG_NO_UDEV"] = "1"
+        cfg = w.Config(conf)
+        cfg.socket = os.path.join(d, "run", "winplug.sock")
+        cfg.state = os.path.join(d, "state.json")
+        return cfg, w.Daemon(cfg)
+
+    def test_tool_trusted(self):
+        self.assertTrue(w.tool_trusted("/usr/bin/env"))       # root-owned, 0755, in root-owned dirs
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            mine = f.name
+        os.chmod(mine, 0o755)
+        self.assertFalse(w.tool_trusted(mine))                 # ours: never run as root
+        os.unlink(mine)
+        self.assertFalse(w.tool_trusted("/nonexistent/omarchy-windows-vm"))
+
+    def test_job_argv(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d)
+            cfg.uid = 1000
+            cfg.vm_runner = "direct"
+            argv = dm.job_argv("up")
+            self.assertEqual(argv[:2], ["env", "-i"])
+            self.assertIn("PKEXEC_UID=1000", argv)
+            self.assertEqual(argv[-3:], ["/usr/bin/omarchy-windows-vm", "__priv", "up"])
+            cfg.vm_runner = "systemd-run"
+            argv = dm.job_argv("down")
+            self.assertEqual(argv[0], "systemd-run")
+            self.assertIn("--wait", argv); self.assertIn("--pipe", argv)
+            self.assertIn("--setenv=PKEXEC_UID=1000", argv)
+            self.assertIn("RuntimeMaxSec=%d" % w.VM_JOB_TIMEOUT["down"], argv)
+            self.assertEqual(argv[-3:], ["/usr/bin/omarchy-windows-vm", "__priv", "down"])
+
+    def read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def test_write_autostart(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d, "[winplug]\nuser = someone\n# a comment\nautostart = false\nusb_bus = xhci.0\n")
+            self.assertFalse(cfg.autostart)
+            self.assertEqual(dm.write_autostart(True), "")
+            text = self.read(cfg.path)
+            self.assertIn("autostart = true\n", text)
+            self.assertIn("user = someone\n", text)
+            self.assertIn("# a comment\n", text)
+            self.assertNotIn("autostart = false", text)
+            self.assertTrue(cfg.autostart)
+            self.assertTrue(w.Config(cfg.path).autostart)
+            # Without the key it goes right under the section header.
+            with open(cfg.path, "w") as f:
+                f.write("[winplug]\nuser = someone\n")
+            self.assertEqual(dm.write_autostart(True), "")
+            self.assertEqual(self.read(cfg.path), "[winplug]\nautostart = true\nuser = someone\n")
+            # No config file at all.
+            os.unlink(cfg.path)
+            self.assertEqual(dm.write_autostart(False), "")
+            self.assertEqual(self.read(cfg.path), "[winplug]\nautostart = false\n")
+            self.assertFalse(os.path.exists(cfg.path + ".winplug.tmp"))
+
+    def test_state_reports_job_and_autostart(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d, "[winplug]\nautostart = true\n")
+            cfg.compose = os.path.join(d, "compose.yml")
+            open(cfg.compose, "w").close()
+            dm.vm.installed = True
+            st = dm.state_message()["vm"]
+            self.assertTrue(st["autostart"]); self.assertEqual(st["job"], "")
+            self.assertIn("launcher", st)
+            dm.job = {"kind": "up"}
+            st = dm.state_message()["vm"]
+            self.assertEqual((st["status"], st["job"]), ("starting", "up"))
+            dm.job = {"kind": "down"}
+            self.assertEqual(dm.state_message()["vm"]["status"], "stopping")
+
+class Rdp(unittest.TestCase):
+    def test_session_ended_by(self):
+        for rc in (0, 2, 11):
+            self.assertEqual(cli.session_ended_by(rc), "user")
+        for rc in (1, 3, 5, 10):
+            self.assertEqual(cli.session_ended_by(rc), "windows")
+        for rc in (131, 141, 147, 255):
+            self.assertEqual(cli.session_ended_by(rc), "nobody")
+
+    def test_rdp_answers_only_for_a_real_listener(self):
+        srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(2)
+        cli.RDP_HOST, cli.RDP_PORT = "127.0.0.1", srv.getsockname()[1]
+        def serve(reply):
+            c, _ = srv.accept(); c.recv(64)
+            if reply: c.sendall(reply)
+            c.close()
+        # Accepts and hangs up: docker's proxy with nothing behind it.
+        t = threading.Thread(target=serve, args=(b"",)); t.start()
+        self.assertFalse(cli.rdp_answers(timeout=2)); t.join()
+        # An X.224 Connection Confirm: an RDP listener.
+        t = threading.Thread(target=serve, args=(bytes.fromhex("030000130ed000001234000200080002000000"),)); t.start()
+        self.assertTrue(cli.rdp_answers(timeout=2)); t.join()
+        srv.close()
+        self.assertFalse(cli.rdp_answers(timeout=1))            # nothing listening
+
+    def test_x224_request_is_well_formed(self):
+        req = cli.X224_CONNECT
+        self.assertEqual(len(req), 19)
+        self.assertEqual(req[:4], b"\x03\x00\x00\x13")          # TPKT, length 19
+        self.assertEqual(req[4], 14); self.assertEqual(req[5], 0xE0)   # X.224 CR
+        self.assertEqual(req[11], 1)                            # RDP_NEG_REQ
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -53,17 +53,42 @@ else
     note "enabled, in the right section of the bar"
 fi
 
+# "Windows" in the app launcher is Omarchy's desktop entry, which runs
+# `omarchy-windows-vm launch`: a password prompt to start, another to stop,
+# and an RDP attempt before Windows is up.  Point it at `winplug launch`
+# instead, and keep the original line so uninstall.sh can put it back.
+say "Wiring the Windows app entry"
+entry="$HOME/.local/share/applications/windows-vm.desktop"
+if [[ -f $entry ]]; then
+    if grep -q '^Exec=.*winplug launch' "$entry"; then
+        note "already runs winplug launch"
+    else
+        orig=$(sed -n 's/^Exec=//p' "$entry" | head -n1)
+        tmp=$(mktemp "$entry.XXXXXX")
+        awk -v orig="$orig" '
+            /^X-Winplug/ { next }
+            /^Exec=/ { print "Exec=uwsm app -- /usr/local/bin/winplug launch"; print "X-Winplug-Original-Exec=" orig; next }
+            { print }' "$entry" >"$tmp" && mv -f "$tmp" "$entry"
+        note "\"Windows\" in the app launcher now runs: winplug launch"
+        note "(no password prompts; the session opens once Windows actually answers)"
+    fi
+    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+else
+    note "no Windows app entry yet ('omarchy windows vm install' creates it); run this again afterwards"
+fi
+
 say "Done"
 cat <<EOT
 
     The USB-on-Windows icon is in the bar.  It will say "Helper not running"
     until the root half is installed, which is this one command:
 
-        sudo $plugin_dir/system/install.sh
+        sudo $plugin_dir/system/install.sh            # add --autostart to start Windows at boot
 
-    It installs a small service (winplugd) that talks to the VM's QEMU and
-    adds USB access to the Windows VM's compose file.  If Windows is running
-    right now, stop and start it once afterwards.  Then: winplug doctor
+    It installs a small service (winplugd) that talks to the VM's QEMU, adds
+    USB access to the Windows VM's compose file, and starts and stops Windows
+    for you without password prompts.  If Windows is running right now, stop
+    and start it once afterwards.  Then: winplug doctor
 EOT
 
 if (( ${#warnings[@]} )); then

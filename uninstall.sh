@@ -22,6 +22,18 @@ else
 fi
 omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
 
+say "Giving the Windows app entry back to Omarchy"
+entry="$HOME/.local/share/applications/windows-vm.desktop"
+if [[ -f $entry ]] && grep -q '^X-Winplug-Original-Exec=' "$entry"; then
+    orig=$(sed -n 's/^X-Winplug-Original-Exec=//p' "$entry" | head -n1)
+    tmp=$(mktemp "$entry.XXXXXX")
+    awk -v orig="$orig" '/^X-Winplug/ { next } /^Exec=/ { print "Exec=" orig; next } { print }' "$entry" >"$tmp" && mv -f "$tmp" "$entry"
+    update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+    note "restored: $orig"
+else
+    note "nothing to restore"
+fi
+
 say "Done"
 cat <<EOT
 

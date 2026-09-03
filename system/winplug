@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""winplug -- send USB devices to the Omarchy Windows VM, from the terminal.
+"""winplug -- the Omarchy Windows VM from the terminal: start it, open it,
+and send USB devices into it.
+
+  winplug launch            start Windows if it is off, wait until it answers,
+                            open the RDP session.  This is what the Windows
+                            app entry and the bar button run.  No password.
+      -k, --keep-alive        leave Windows running when the session closes
+                              (already the default while autostart is on)
+      --stop                  stop Windows afterwards even with autostart on
+      --no-connect            start it and return; open it later
+  winplug vm start|stop|status
+  winplug autostart on|off|status
+                            start Windows at boot, in the background
 
   winplug list              devices on this machine and where they are
   winplug add <device>      send a device to Windows (sticky: survives replugs
@@ -15,12 +27,30 @@ or a unique part of the name.  --json on any command prints the raw state.
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import time
 
 SOCKET = os.environ.get("WINPLUG_SOCKET", "/run/winplug/winplug.sock")
+_rdp = os.environ.get("WINPLUG_RDP", "127.0.0.1:3389").rsplit(":", 1)
+RDP_HOST, RDP_PORT = _rdp[0], int(_rdp[1])
+CREDENTIALS = os.path.expanduser("~/.config/windows/credentials")
+KRB5_CONF = os.path.expanduser("~/.config/windows/krb5.conf")
+DESKTOP_ENTRY = os.path.expanduser("~/.local/share/applications/windows-vm.desktop")
+RDP_TITLE = "Windows VM - Omarchy"
+# From "container up" to Windows answering on RDP.  A cold boot on a laptop
+# is a minute or two; a Windows update can make it much longer.
+START_TIMEOUT = 300
+# After Windows ended a session on its own (a reboot, say): how long to wait
+# for it to come back before giving up on reconnecting.
+RETURN_TIMEOUT = 240
+
+# X.224 Connection Request carrying an RDP negotiation request: the smallest
+# thing an RDP listener answers.  Docker's port proxy accepts the TCP
+# connection long before Windows listens, so a plain connect proves nothing.
+X224_CONNECT = bytes.fromhex("030000130ee000000000000100080003000000")
 
 STATUS_TEXT = {
     "attached": "in Windows",
@@ -78,6 +108,33 @@ class Client:
             if m.get("type") == "reply":
                 return m
 
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def req(timeout=5.0, **kw):
+    """One request on a fresh connection.  Nothing holds a connection open
+    across a long RDP session, where the helper's pushes would pile up."""
+    c = Client(timeout=timeout)
+    c.wait_state()
+    r = c.request(**kw)
+    c.close()
+    return r
+
+
+def vm_now():
+    c = Client()
+    vm = c.wait_state()["vm"]
+    c.close()
+    return vm
+
+
+# --------------------------------------------------------------------------
+# Devices
+# --------------------------------------------------------------------------
 
 def find_device(state, what):
     devs = state["devices"]
@@ -136,9 +193,10 @@ def cmd_status(args):
     if "--json" in args:
         print(json.dumps(st["vm"], indent=2))
         return
-    print("%s · %d assigned, %d in Windows · compose %s" % (
+    print("%s · %d assigned, %d in Windows · compose %s%s" % (
         st["vm"]["message"], st["assigned_count"], st["attached_count"],
-        "has USB access" if st["vm"]["compose_patched"] else "NOT patched"))
+        "has USB access" if st["vm"]["compose_patched"] else "NOT patched",
+        " · autostart on" if st["vm"].get("autostart") else ""))
 
 
 def cmd_change(args, cmd):
@@ -183,6 +241,291 @@ def cmd_watch(args):
                 print("   ", d["key"], d["name"], "->", STATUS_TEXT.get(d["status"], d["status"]))
 
 
+# --------------------------------------------------------------------------
+# Launching Windows
+# --------------------------------------------------------------------------
+
+class Say:
+    """Progress for a person: lines on the terminal, and notifications when
+    there is no terminal (the app entry runs this without one)."""
+
+    def __init__(self):
+        self.tty = sys.stderr.isatty()
+        self.tool = shutil.which("omarchy-notification-send") or shutil.which("notify-send")
+
+    def __call__(self, headline, body="", urgency="normal", notify=None):
+        print(headline + ((": " + body) if body else ""), file=sys.stderr)
+        if not self.tool:
+            return
+        if notify is None:
+            notify = not self.tty
+        if not notify:
+            return
+        argv = [self.tool, "--app-name", "Winplug", "-u", urgency, "-r", "91733", headline]
+        if body:
+            argv.append(body)
+        try:
+            subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+
+def rdp_answers(timeout=2.0):
+    """True when whatever sits at the RDP port completes an X.224 handshake."""
+    try:
+        with socket.create_connection((RDP_HOST, RDP_PORT), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(X224_CONNECT)
+            data = b""
+            while len(data) < 6:
+                chunk = s.recv(64)
+                if not chunk:
+                    break
+                data += chunk
+    except OSError:
+        return False
+    return len(data) >= 6 and data[0] == 3 and data[5] == 0xD0
+
+
+def wait_rdp(timeout, every=1.0, tick=None):
+    deadline = time.monotonic() + timeout
+    n = 0
+    while time.monotonic() < deadline:
+        if rdp_answers():
+            return True
+        n += 1
+        if tick:
+            tick(n, int(deadline - time.monotonic()))
+        time.sleep(every)
+    return False
+
+
+def session_ended_by(rc):
+    """Who ended the RDP session, from xfreerdp3's exit code
+    (client/X11/xfreerdp.h): 0 success, 2 logoff and 11 disconnect-by-user
+    mean the person did; 128 and up mean no session was ever made; the rest
+    (1 disconnect, 3-10) mean Windows did: a reboot, another session, idle."""
+    if rc in (0, 2, 11):
+        return "user"
+    if rc >= 128:
+        return "nobody"
+    return "windows"
+
+
+def read_credentials():
+    """Omarchy's private RDP credentials, with its own fallback."""
+    user = password = ""
+    try:
+        with open(CREDENTIALS) as f:
+            for line in f:
+                key, _, value = line.rstrip("\n").partition("=")
+                if key == "USERNAME":
+                    user = value
+                elif key == "PASSWORD":
+                    password = value
+    except OSError:
+        pass
+    return user or "docker", password or "admin"
+
+
+def rdp_env():
+    """The same realm-less Kerberos config Omarchy's launcher writes, so
+    FreeRDP falls straight through to NTLM instead of looking for a KDC."""
+    env = dict(os.environ)
+    try:
+        if not os.path.exists(KRB5_CONF):
+            os.makedirs(os.path.dirname(KRB5_CONF), exist_ok=True)
+            with open(KRB5_CONF, "w") as f:
+                f.write("[libdefaults]\n  dns_lookup_kdc = false\n  dns_lookup_realm = false\n")
+        env["KRB5_CONFIG"] = KRB5_CONF
+    except OSError:
+        pass
+    return env
+
+
+def rdp_scale():
+    """Omarchy's rule: HiDPI monitors get a scaled session."""
+    try:
+        out = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=5).stdout
+        scale = next((m.get("scale", 1) for m in json.loads(out) if m.get("focused")), 1)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    pct = int(float(scale) * 100)
+    if pct >= 170:
+        return ["/scale:180"]
+    if pct >= 130:
+        return ["/scale:140"]
+    return []
+
+
+def run_rdp(user, password):
+    """Omarchy's own xfreerdp3 line, flag for flag."""
+    argv = ["xfreerdp3", "/u:" + user, "/p:" + password, "/v:%s:%d" % (RDP_HOST, RDP_PORT),
+            "-grab-keyboard", "/sound", "/microphone", "/clipboard", "/cert:ignore",
+            "/title:" + RDP_TITLE, "/dynamic-resolution", "/gfx:AVC444",
+            "/floatbar:sticky:off,default:visible,show:fullscreen"] + rdp_scale()
+    try:
+        return subprocess.run(argv, env=rdp_env(), stdin=subprocess.DEVNULL).returncode
+    except FileNotFoundError:
+        die("xfreerdp3 not found (sudo pacman -S freerdp)")
+
+
+def cmd_launch(args):
+    keep = "-k" in args or "--keep-alive" in args
+    force_stop = "--stop" in args
+    connect = "--no-connect" not in args
+    say = Say()
+    vm = vm_now()
+    if not vm["installed"]:
+        die("Windows VM is not installed: omarchy windows vm install")
+    if not vm.get("launcher", True):
+        die("the helper will not start Windows: omarchy-windows-vm is not a root-owned launcher (winplug doctor)")
+    keep = keep or (bool(vm.get("autostart")) and not force_stop)
+
+    if vm["status"] == "stopping":
+        say("Windows is shutting down", "waiting for that to finish first")
+        for _ in range(120):
+            time.sleep(2)
+            vm = vm_now()
+            if vm["status"] != "stopping":
+                break
+    if vm["status"] not in ("running", "running-no-usb"):
+        say("Starting Windows", "the session opens when Windows answers; a cold start takes a minute or two")
+        r = req(timeout=None, cmd="vm_up")
+        if not r.get("ok"):
+            say("Windows did not start", r.get("error", "unknown error"), "critical", notify=True)
+            return 1
+    if not connect:
+        print("Windows is %s." % ("running" if vm["status"].startswith("running") else "starting"))
+        return 0
+
+    def tick(n, left):
+        if n % 30 == 0:
+            say("Still waiting for Windows to answer", "%d s left" % left, notify=False)
+    if not wait_rdp(START_TIMEOUT, tick=tick):
+        say("Windows is not answering",
+            "no RDP answer in %d minutes; it is left running, see http://127.0.0.1:8006 and try again"
+            % (START_TIMEOUT // 60), "critical", notify=True)
+        return 1
+
+    user, password = read_credentials()
+    failures = 0
+    while True:
+        rc = run_rdp(user, password)
+        who = session_ended_by(rc)
+        if who == "user":
+            break
+        if who == "nobody":
+            failures += 1
+            if failures > 4:
+                say("Could not connect to Windows",
+                    "xfreerdp3 exit code %d after %d tries; Windows is left running" % (rc, failures),
+                    "critical", notify=True)
+                return 1
+            say("Connection failed", "xfreerdp3 exit code %d; trying again" % rc)
+            time.sleep(3)
+            if not wait_rdp(90):
+                say("Windows stopped answering", "it is left running", "critical", notify=True)
+                return 1
+            continue
+        # Windows ended the session itself: a reboot, a shutdown from inside,
+        # another session taking over.  Wait for it and open it again.
+        say("Windows closed the session", "waiting for it to come back; the session reopens by itself")
+        back = False
+        deadline = time.monotonic() + RETURN_TIMEOUT
+        while time.monotonic() < deadline:
+            if rdp_answers():
+                back = True
+                break
+            if vm_now()["status"] in ("off", "not-installed", "unknown"):
+                break
+            time.sleep(2)
+        if not back:
+            break
+        failures = 0
+
+    # The session is over.  Leave a running Windows alone unless it should
+    # stop now; tidy up after one that shut itself down.
+    vm = vm_now()
+    if vm["status"] not in ("running", "running-no-usb", "starting"):
+        if vm.get("container_status") in ("exited", "created", "dead"):
+            req(timeout=None, cmd="vm_down")
+        print("Windows is off.")
+        return 0
+    if keep:
+        print("Windows keeps running%s." % (" (autostart is on)" if vm.get("autostart") and not force_stop else ""))
+        return 0
+    say("Stopping Windows", notify=False)
+    r = req(timeout=None, cmd="vm_down")
+    if not r.get("ok"):
+        say("Could not stop Windows", r.get("error", "unknown error"), "critical", notify=True)
+        return 1
+    print("Windows stopped.")
+    return 0
+
+
+def cmd_vm(args):
+    what = args[0] if args else "status"
+    if what in ("start", "up"):
+        vm = vm_now()
+        if vm["status"] in ("running", "running-no-usb"):
+            print("Windows is already running.")
+            return 0
+        print("Starting Windows…")
+        r = req(timeout=None, cmd="vm_up")
+        if not r.get("ok"):
+            die(r.get("error", "failed"))
+        print("Windows is starting; `winplug launch` opens it once it answers.")
+    elif what in ("stop", "down"):
+        print("Stopping Windows…")
+        r = req(timeout=None, cmd="vm_down")
+        if not r.get("ok"):
+            die(r.get("error", "failed"))
+        print("Windows stopped.")
+    elif what == "status":
+        vm = vm_now()
+        if "--json" in args:
+            print(json.dumps(vm, indent=2))
+        else:
+            print(vm["message"] + (" · autostart on" if vm.get("autostart") else ""))
+    else:
+        die("winplug vm start|stop|status", 2)
+    return 0
+
+
+def cmd_autostart(args):
+    what = args[0] if args else "status"
+    if what in ("on", "off"):
+        r = req(cmd="set_autostart", on=(what == "on"))
+        if not r.get("ok"):
+            die(r.get("error", "failed"))
+        if what == "on":
+            print("Autostart on: Windows starts at boot and keeps running when you close the session.")
+            print("Stop it when you want to with: winplug vm stop")
+        else:
+            print("Autostart off: Windows starts when you open it and stops when you close it.")
+    elif what == "status":
+        print("autostart is " + ("on" if vm_now().get("autostart") else "off"))
+    else:
+        die("winplug autostart on|off|status", 2)
+    return 0
+
+
+def desktop_entry_exec():
+    try:
+        with open(DESKTOP_ENTRY) as f:
+            for line in f:
+                if line.startswith("Exec="):
+                    return line[5:].strip()
+    except OSError:
+        return None
+    return ""
+
+
+# --------------------------------------------------------------------------
+# Doctor
+# --------------------------------------------------------------------------
+
 def cmd_doctor(args):
     ok = True
     def check(cond, good, bad):
@@ -209,6 +552,21 @@ def cmd_doctor(args):
         check(False, "", "the running VM has no /dev/bus/usb; stop and start Windows once")
     elif vm["status"] == "running":
         check(vm["usb_access"], "the running VM sees /dev/bus/usb", "the running VM has no /dev/bus/usb")
+    check("launcher" in vm, "helper speaks this version of the protocol",
+          "helper is older than this command; run: sudo .../system/install.sh")
+    if "launcher" in vm:
+        check(vm["launcher"], "helper can start and stop Windows (root-owned omarchy-windows-vm)",
+              "helper refuses to run omarchy-windows-vm as root: not root-owned, or writable by others")
+    check(shutil.which("xfreerdp3"), "xfreerdp3 found", "xfreerdp3 missing: sudo pacman -S freerdp")
+    check(os.path.exists(CREDENTIALS), "RDP credentials file present",
+          "no %s (omarchy windows vm install writes it); falling back to docker/admin" % CREDENTIALS)
+    entry = desktop_entry_exec()
+    if entry is None:
+        print("  info no Windows app entry yet (omarchy windows vm install creates it)")
+    else:
+        check("winplug launch" in entry, "the Windows app entry runs winplug launch",
+              "the Windows app entry runs %r: run install.sh again to rewire it (that path prompts for passwords)" % entry)
+    print("  info autostart is %s" % ("on" if vm.get("autostart") else "off"))
     plug = os.path.expanduser("~/.config/omarchy/plugins/io.github.mechanicsunlocked.winplug/manifest.json")
     check(os.path.exists(plug), "bar plugin installed", "bar plugin not installed: see README")
     for d in st["devices"]:
@@ -235,6 +593,12 @@ def main(argv):
         cmd_watch(args)
     elif cmd == "doctor":
         return cmd_doctor(args)
+    elif cmd in ("launch", "connect", "open", "start"):
+        return cmd_launch(args)
+    elif cmd == "vm":
+        return cmd_vm(args)
+    elif cmd == "autostart":
+        return cmd_autostart(args)
     else:
         die("unknown command %r; try `winplug help`" % cmd, 2)
     return 0

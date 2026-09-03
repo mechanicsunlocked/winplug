@@ -62,7 +62,7 @@ def control(line):
     if parts[0] == "plug": host.add(parts[1]); return "ok\n"
     if parts[0] == "unplug": host.discard(parts[1]); return "ok\n"
     if parts[0] == "noaccess": no_access = parts[1] == "1"; return "ok\n"
-    if parts[0] == "dump": return json.dumps({"host": sorted(host), "qdevs": qdevs, "attached": attached_ids(), "log": log[-20:]}) + "\n"
+    if parts[0] == "dump": return json.dumps({"host": sorted(host), "qdevs": qdevs, "attached": attached_ids(), "log": log[-20:], "total": len(log), "total_del": sum(1 for c in log if c.strip().startswith("device_del"))}) + "\n"
     return "?\n"
 
 client = None; buf = b""

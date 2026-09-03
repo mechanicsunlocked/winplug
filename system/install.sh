@@ -7,12 +7,25 @@
 # with the user who ran sudo, and starts the service.  Idempotent; running it
 # again is how you upgrade.  The daemon patches the Windows VM compose on its
 # first tick, so no other root step exists.
+#
+#   --autostart      start Windows at boot (same as `winplug autostart on`)
+#   --no-autostart   turn that off again
 set -euo pipefail
 
 if [ "$(id -u)" != 0 ]; then
     echo "run with sudo" >&2
     exit 1
 fi
+
+autostart=""
+for arg in "$@"; do
+    case $arg in
+    --autostart) autostart=true ;;
+    --no-autostart) autostart=false ;;
+    -h | --help) sed -n '2,13p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+    esac
+done
 
 here=$(cd "$(dirname "$0")" && pwd)
 user="${WINPLUG_USER:-${SUDO_USER:-}}"
@@ -43,6 +56,13 @@ if [[ -f $conf ]]; then
 else
     sed "s|CHANGEME|$user|" "$here/winplug.conf.example" >"$conf"
 fi
+if [[ -n $autostart ]]; then
+    if grep -qE '^\s*autostart\s*=' "$conf"; then
+        sed -i -E "s|^(\s*autostart\s*=).*|\1 $autostart|" "$conf"
+    else
+        printf 'autostart = %s\n' "$autostart" >>"$conf"
+    fi
+fi
 chmod 0644 "$conf"
 
 systemctl daemon-reload
@@ -57,6 +77,12 @@ if systemctl is-active --quiet winplugd.service; then
     echo "Windows VM compose: the USB bind mount is added automatically; if Windows"
     echo "is running right now, stop and start it once so it gains USB access."
     echo
+    if grep -qE '^\s*autostart\s*=\s*true' "$conf"; then
+        echo "Autostart is on: Windows starts at boot and stays up when you close the session."
+    else
+        echo "Autostart is off (winplug autostart on / sudo $0 --autostart)."
+    fi
+    echo "Open Windows with the app entry, the bar button, or:  winplug launch"
     echo "Check with:  winplug doctor"
 else
     echo "winplugd failed to start:" >&2
