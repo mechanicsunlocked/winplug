@@ -66,7 +66,10 @@ the "Windows" app entry back to Omarchy's launcher.
 
 ## How to use it
 
-Click the icon. Two lists: **In Windows** and **On this machine**.
+Click the icon. At the top, Windows itself: a power switch (start it, or shut
+it down after a "Shut down Windows?" question), an *Open* button while it is
+running, and a *Start Windows at boot* toggle. Below, two lists: **In Windows**
+and **On this machine**.
 
 | Do this | Get this |
 |---|---|
@@ -75,7 +78,14 @@ Click the icon. Two lists: **In Windows** and **On this machine**.
 | right-click a device in Windows | same as click: take it back |
 | `j` / `k`, `Enter` | keyboard: move, toggle |
 | `x` | take the highlighted device back |
-| `s` | start Windows, or open the session when it is already running |
+| `s` | open the session (starting Windows first if it is off) |
+| `p` | power: start Windows, or shut it down (asks first) |
+| `a` | start Windows at boot: on / off |
+| `r` | ask the helper for a fresh state |
+
+The switch and the toggle go through the helper, so none of it asks for a
+password. Shutting down is Omarchy's own `docker compose down`: Windows gets
+an ACPI power-off and up to two minutes to finish.
 
 The row tells you where things stand: *In Windows*, *Sending…*, *Goes to
 Windows when it starts*, *Not plugged in · still assigned*, or *Blocked ·

@@ -55,6 +55,24 @@ Panel {
   readonly property int attachedCount: helperState && helperState.attached_count ? helperState.attached_count : 0
   readonly property int assignedCount: helperState && helperState.assigned_count ? helperState.assigned_count : 0
 
+  // ---- Windows itself: power and autostart -----------------------------------
+  //
+  // The helper starts and stops the VM through Omarchy's own privileged entry
+  // point, without a password prompt, but only when that launcher is
+  // root-owned (the `launcher` flag).  Autostart is a line in the helper's
+  // config, flipped through the same socket.
+  readonly property bool canPower: helperConnected && vm && vm.installed === true && vm.launcher !== false
+  // The switch shows the *desired* state: on while running or coming up, off
+  // while shutting down.
+  readonly property bool powerOn: vmRunning || vmStatus === "starting"
+  readonly property bool autostartOn: vm && vm.autostart === true
+  // Optimistic autostart value after a click, until the next state push.
+  property int autostartPending: -1
+  readonly property bool autostartShown: autostartPending >= 0 ? autostartPending === 1 : autostartOn
+  property bool stopConfirmOpen: false
+  // The last refused request, shown under the hero for a moment.
+  property string lastError: ""
+
   function isAssigned(d) {
     var p = root.pending[d.key]
     if (p === "attach") return true
@@ -98,13 +116,28 @@ Panel {
     if (msg.type === "state") {
       root.helperState = msg
       root.pending = ({})
+      root.autostartPending = -1
     } else if (msg.type === "reply" && msg.ok === false) {
-      // A refused request: drop the optimism for that device.
+      // A refused request: drop the optimism for that device, or for the
+      // autostart switch, and say why.
       var next = {}
       for (var k in root.pending) if (k !== msg.key) next[k] = root.pending[k]
       root.pending = next
+      if (msg.cmd === "set_autostart") root.autostartPending = -1
+      root.showError(String(msg.cmd || "request") + ": " + String(msg.error || "failed"))
       console.warn("winplug:", msg.cmd, "failed:", msg.error)
     }
+  }
+
+  function showError(text) {
+    root.lastError = text
+    errorTimer.restart()
+  }
+
+  Timer {
+    id: errorTimer
+    interval: 12000
+    onTriggered: root.lastError = ""
   }
 
   function request(obj) {
@@ -141,6 +174,35 @@ Panel {
   // an app through uwsm so it outlives this panel like any launched program.
   function launchWindows() {
     Quickshell.execDetached(["uwsm", "app", "--", "/usr/local/bin/winplug", "launch"])
+  }
+
+  // Power, through the helper.  The helper answers `vm_up`/`vm_down` when the
+  // action is done (minutes, for a shutdown) and pushes "starting"/"stopping"
+  // state right away, which is what the switch shows as busy meanwhile.
+  function startWindows() {
+    if (!root.canPower || root.vmBusy) return
+    root.lastError = ""
+    request({ cmd: "vm_up" })
+  }
+  function stopWindows() {
+    root.stopConfirmOpen = false
+    if (!root.canPower || root.vmBusy) return
+    root.lastError = ""
+    request({ cmd: "vm_down" })
+  }
+  // Off -> start right away; on -> ask first, a shutdown ends whatever is
+  // going on in there.
+  function togglePower() {
+    if (!root.canPower || root.vmBusy) return
+    if (root.powerOn) root.stopConfirmOpen = true
+    else root.startWindows()
+  }
+  function toggleAutostart() {
+    if (!root.canPower) return
+    var on = !root.autostartShown
+    root.autostartPending = on ? 1 : 0
+    root.lastError = ""
+    request({ cmd: "set_autostart", on: on })
   }
 
   // ---- words ----------------------------------------------------------------
@@ -217,6 +279,7 @@ Panel {
     clampCursor()
   }
   onOpenedChanged: {
+    stopConfirmOpen = false
     if (opened) {
       selectedIndex = 0
       cursorActive = false
@@ -371,19 +434,53 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      // While the shutdown question is up, the keys belong to it.
       onMoveRequested: function(dx, dy) {
+        if (root.stopConfirmOpen) {
+          if (dx !== 0) stopConfirm.selectedIndex = stopConfirm.selectedIndex === 0 ? 1 : 0
+          return
+        }
         if (!root.cursorActive) { root.cursorActive = true; return }
         if (dy !== 0) root.moveCursor(dy)
         else if (dx > 0) root.actionFocused = true
         else if (dx < 0) root.actionFocused = false
       }
-      onActivateRequested: if (root.cursorActive) root.activateCursor()
-      onCloseRequested: root.close()
+      onActivateRequested: {
+        if (root.stopConfirmOpen) {
+          if (stopConfirm.selectedIndex === 0) root.stopConfirmOpen = false
+          else root.stopWindows()
+          return
+        }
+        if (root.cursorActive) root.activateCursor()
+      }
+      onCloseRequested: {
+        if (root.stopConfirmOpen) root.stopConfirmOpen = false
+        else root.close()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onDeleteRequested: if (root.cursorActive) root.deleteSelected()
+      onDeleteRequested: if (root.cursorActive && !root.stopConfirmOpen) root.deleteSelected()
       onTextKey: function(t) {
+        if (root.stopConfirmOpen) return
         if ((t === "s" || t === "S") && root.canLaunch) root.launchWindows()
+        if (t === "p" || t === "P") root.togglePower()
+        if (t === "a" || t === "A") root.toggleAutostart()
         if (t === "r" || t === "R") root.request({ cmd: "state" })
+      }
+
+      // "Shut down Windows?" -- a click on the power switch while it is on.
+      ConfirmDialog {
+        id: stopConfirm
+        anchors.fill: parent
+        z: 10
+        opened: root.stopConfirmOpen
+        message: root.attachedCount > 0
+          ? "Shut down Windows? " + root.attachedCount + (root.attachedCount === 1 ? " USB device is" : " USB devices are") + " in use there."
+          : "Shut down Windows?"
+        confirmText: "Shut down"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onCanceled: root.stopConfirmOpen = false
+        onConfirmed: root.stopWindows()
       }
 
       Column {
@@ -392,35 +489,104 @@ Panel {
         spacing: Style.space(14)
 
         // ---------- Hero ----------
-        PanelHero {
-          title: "Winplug"
-          meta: root.heroMeta
-          detail: root.attachedCount > 0 ? String(root.attachedCount) : ""
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-          iconComponent: Component {
-            WinplugIcon {
-              width: Style.font.display
-              height: Style.font.display
-              ink: root.foreground
-              lit: root.attachedCount > 0
-              opacity: root.helperConnected ? 1.0 : 0.5
+        Item {
+          id: heroHost
+          width: parent.width
+          implicitHeight: hero.implicitHeight
+          // Inside the hero's icon and trailing control, `root` is the
+          // PanelHero, not this panel (Omarchy's own panels note the same),
+          // so those reach panel state through this item.
+          readonly property bool connected: root.helperConnected
+          readonly property bool lit: root.attachedCount > 0
+          readonly property bool showOpen: root.canLaunch && root.vmRunning
+          readonly property bool showPower: root.canPower
+          readonly property bool powerOn: root.powerOn
+          readonly property bool busy: root.vmBusy
+          readonly property color fg: root.foreground
+          readonly property string font: root.fontFamily
+          readonly property string powerHint: root.vmBusy
+            ? (root.vmStatus === "starting" ? "Windows is starting" : "Windows is shutting down")
+            : (root.powerOn ? "Shut down Windows (P)" : "Start Windows (P)")
+          function openWindows() { root.launchWindows() }
+          function togglePower() { root.togglePower() }
+
+          PanelHero {
+            id: hero
+            width: parent.width
+            title: "Winplug"
+            meta: root.heroMeta
+            detail: root.attachedCount > 0 ? String(root.attachedCount) : ""
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            iconComponent: Component {
+              WinplugIcon {
+                width: Style.font.display
+                height: Style.font.display
+                ink: heroHost.fg
+                lit: heroHost.lit
+                opacity: heroHost.connected ? 1.0 : 0.5
+              }
+            }
+            // Open the session (when Windows is up), and the power switch.
+            trailingControl: Component {
+              Row {
+                spacing: Style.space(10)
+
+                PanelActionButton {
+                  visible: heroHost.showOpen
+                  anchors.verticalCenter: parent.verticalCenter
+                  iconText: "\uf17a"
+                  tooltipText: "Open Windows (S)"
+                  foreground: heroHost.fg
+                  hoverColor: heroHost.fg
+                  fontFamily: heroHost.font
+                  bordered: true
+                  onClicked: heroHost.openWindows()
+                }
+
+                ToggleSwitch {
+                  id: powerSwitch
+                  visible: heroHost.showPower
+                  anchors.verticalCenter: parent.verticalCenter
+                  checked: heroHost.powerOn
+                  busy: heroHost.busy
+                  foreground: heroHost.fg
+                  onToggled: heroHost.togglePower()
+
+                  PanelToolTip {
+                    visible: powerSwitch.containsMouse
+                    text: heroHost.powerHint
+                    fontFamily: heroHost.font
+                  }
+                }
+              }
             }
           }
-          trailingControl: root.canLaunch ? startButton : null
         }
 
-        Component {
-          id: startButton
-          PanelActionButton {
-            iconText: root.vmRunning ? "\uf17a" : "\uf011"
-            tooltipText: root.vmRunning ? "Open Windows" : "Start Windows"
-            foreground: root.foreground
-            hoverColor: root.foreground
-            fontFamily: root.fontFamily
-            bordered: true
-            onClicked: root.launchWindows()
-          }
+        Text {
+          textFormat: Text.PlainText
+          visible: root.lastError !== ""
+          text: root.lastError
+          color: root.bar ? root.bar.urgent : Color.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+          width: parent.width
+        }
+
+        // ---------- Autostart ----------
+        Toggle {
+          visible: root.canPower
+          width: parent.width
+          label: "Start Windows at boot"
+          description: root.autostartShown
+            ? "Comes up in the background after login and stays up when you close a session."
+            : "Starts when you open it and shuts down when you close the session."
+          checked: root.autostartShown
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.toggleAutostart()
         }
 
         PanelSeparator { foreground: root.foreground }
@@ -512,6 +678,17 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           wrapMode: Text.WordWrap
+          width: parent.width
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          visible: root.canPower
+          text: "S open · P start / shut down · A autostart · R refresh"
+          color: root.dimmer
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
           width: parent.width
         }
       }
