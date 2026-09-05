@@ -9,6 +9,9 @@
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/winplug-reconnect.XXXXXX")
+# Nothing may be written into the plugin directory (Omarchy reloads the
+# plugin on any change there, which strands a locked screen).
+export PYTHONDONTWRITEBYTECODE=1
 trap 'kill $(jobs -p) 2>/dev/null; sleep 0.2; kill -9 $(jobs -p) 2>/dev/null; rm -rf "$work"' EXIT
 
 fail=0

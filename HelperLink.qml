@@ -7,24 +7,28 @@ import Quickshell.Io
 // Quickshell 0.3.1's Socket cannot be re-dialled once a dial has failed: the
 // failed QLocalSocket is kept, and every later `connected = true` finds "a
 // socket exists" and does nothing (io/socket.cpp, setConnected).  A helper
-// restart hits exactly that -- the first retry lands while the old socket
-// file is gone or refusing, and from then on the panel says "helper not
-// running" until the whole shell is restarted.  A freshly built Socket dials
-// every time, so the Socket lives in a Loader and every retry replaces it.
+// restart hits exactly that: when the peer closes, a Socket whose internal
+// target-connected flag is still set re-dials by itself a few milliseconds
+// later, into a helper that is not back yet, and from then on it is wedged.
+// A freshly built Socket dials every time, so the Socket lives in a Loader
+// and every retry replaces it.
+//
+// Nothing here trusts a property binding on the Socket to notice trouble:
+// liveness is read straight off the current Socket on an always-running
+// timer, and every socket error schedules a redial as well.
 Item {
   id: link
 
   // Socket path; empty means "do not dial".
   property string path: ""
-  // How often to knock while not connected.
+  // How often to check the link and knock again while it is down.
   property int retryInterval: 2000
 
   // The live Socket object, or null between dials.
   readonly property var socket: sockLoader.item
-  // Quickshell's Socket notifies `connected` through connectionStateChanged,
-  // so bind to the property; this readonly property then has a proper
-  // connectedChanged of its own for users of the link.
-  readonly property bool connected: socket ? socket.connected === true : false
+  // Kept up to date imperatively (see refresh()), never derived from a
+  // binding on the Socket.
+  property bool connected: false
 
   // One complete line from the helper, without the newline.
   signal line(string text)
@@ -32,6 +36,12 @@ Item {
   visible: false
   width: 0
   height: 0
+
+  function refresh() {
+    var s = sockLoader.item
+    var now = !!(s && s.connected === true)
+    if (now !== link.connected) link.connected = now
+  }
 
   Loader {
     id: sockLoader
@@ -45,19 +55,30 @@ Item {
         // current one speaks for the helper.
         onRead: function(text) { if (sockLoader.item === s) link.line(text) }
       }
+      onConnectionStateChanged: if (sockLoader.item === s) link.refresh()
+      // Peer closed, refused, not found: whatever it is, this object is
+      // done; the retry timer replaces it soon.
+      onError: function(err) { if (sockLoader.item === s) { link.refresh(); soon.restart() } }
     }
-    // Whichever order the engine applies `path` and `connected` in, the new
-    // object must end up dialling.
-    onLoaded: if (item && !item.connected) item.connected = true
+    onItemChanged: link.refresh()
   }
 
-  // The Loader made the first attempt when it was created; the timer only
-  // handles the retries.
+  // A quick retry right after an error, so a helper restart costs the bar
+  // well under a second rather than a full interval.
+  Timer {
+    id: soon
+    interval: 400
+    onTriggered: { link.refresh(); if (!link.connected) link.redial() }
+  }
+
+  // The steady check.  It runs whenever there is a path, connected or not:
+  // reading the state off the Socket every tick is cheap, and it means no
+  // missed signal can leave the link down for good.
   Timer {
     interval: link.retryInterval
     repeat: true
-    running: link.path !== "" && !link.connected
-    onTriggered: link.redial()
+    running: link.path !== ""
+    onTriggered: { link.refresh(); if (!link.connected) link.redial() }
   }
 
   // The path can change after creation (the bar injects the widget's
@@ -75,7 +96,7 @@ Item {
   // Write one line (the caller supplies the newline).  False when there is
   // nothing to write to.
   function send(text) {
-    var s = link.socket
+    var s = sockLoader.item
     if (!s || !s.connected) return false
     s.write(text)
     s.flush()

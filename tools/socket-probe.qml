@@ -27,7 +27,23 @@ ShellRoot {
       return
     }
     console.log("PROBE loaded path=" + item.path + " connected=" + item.connected)
-    item.connectedChanged.connect(function() { console.log("PROBE connected=" + item.connected) })
+    // PROBE_POKE=1 reproduces what the bar was seen doing: writing
+    // `connected = true` to an already connected Socket.  That is a no-op on
+    // the wire but arms Quickshell's internal target-connected flag, so the
+    // next peer-closed makes the same Socket object re-dial at once (into a
+    // helper that is not back yet) and sit wedged on the failed attempt.
+    var poked = false
+    item.connectedChanged.connect(function() {
+      console.log("PROBE connected=" + item.connected)
+      if (item.connected && !poked && Quickshell.env("PROBE_POKE") === "1") {
+        poked = true
+        // A tick later: the link's `socket` binding settles after `connected`.
+        Qt.callLater(function() {
+          if (item.socket) { item.socket.connected = true; console.log("PROBE poked") }
+          else console.log("PROBE poke skipped: no socket")
+        })
+      }
+    })
     item.line.connect(function(text) {
       console.log("PROBE line " + text)
       // Answer a state push with a request, to prove writes work too.

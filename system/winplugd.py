@@ -584,13 +584,18 @@ class Store:
         try:
             with open(self.path) as f:
                 data = json.load(f)
-            self.assigned = {k: v for k, v in data.get("assigned", {}).items()
-                             if re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", k) and isinstance(v, dict)}
-        except (OSError, ValueError, TypeError, AttributeError):
-            # Unreadable or not the shape we wrote: start empty rather than
+        except (OSError, ValueError):
+            data = None
+        assigned = data.get("assigned") if isinstance(data, dict) else None
+        if not isinstance(assigned, dict):
+            # Unreadable, or not the shape we wrote: start empty rather than
             # not at all.  The next assignment rewrites the file.
-            log.warning("state file %s is unusable; starting with no assignments", self.path)
+            if os.path.exists(self.path):
+                log.warning("state file %s is unusable; starting with no assignments", self.path)
             self.assigned = {}
+            return
+        self.assigned = {k: v for k, v in assigned.items()
+                         if re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", k) and isinstance(v, dict)}
 
     def save(self):
         d = os.path.dirname(self.path)
@@ -634,8 +639,7 @@ class Daemon:
         self.last_poll = 0.0         # last `info usb`
         self.audited_pid = 0         # container pid the leftover audit last ran for
         self.pending_removal = set() # device_del that failed; retried when the VM is back
-        self.retry_at = {}           # key -> monotonic time before which a failed device_add is not retried
-        self.last_add_error = {}     # key -> the error last logged for it
+        self.add_failed = {}         # key -> (when to try again, the error) after QEMU refused a device_add
         # VM start/stop: one job at a time, run by a worker thread, finished
         # on the main thread through the wake pipe.
         self.job = None
@@ -855,13 +859,14 @@ class Daemon:
             if not key:
                 return reply(False, "key must look like 1a2b:3c4d")
             present = enumerate_usb(self.cfg.sysfs)
-            name = req.get("name") or (present[key]["name"] if key in present else key)
+            raw = req.get("name") or present.get(key, {}).get("name", "")
             # The name is shown in the panel and written to the log: printable
-            # characters only, and not endless.
-            name = "".join(ch for ch in str(name) if ch.isprintable()).strip()[:120] or key
+            # characters only, not endless, and never empty.
+            name = "".join(ch for ch in str(raw) if ch.isprintable()).strip()[:120] or key
             self.store.assigned[key] = {"name": name, "added": time.time()}
             self.store.save()
             self.unattached_since.pop(key, None)
+            self.add_failed.pop(key, None)
             log.info("assigned %s (%s)", key, name)
             reply(True)
             self.tick()
@@ -872,6 +877,7 @@ class Daemon:
             was = self.store.assigned.pop(key, None)
             self.store.save()
             self.status[key] = "detaching"
+            self.add_failed.pop(key, None)
             err = self.qemu_remove(key)
             if err:
                 # Try again whenever the VM is reachable, so nothing of ours
@@ -995,8 +1001,8 @@ class Daemon:
             log.warning("Windows %s failed (rc %s): %s", verb, rc, err or "no output")
         self.vm._last_docker = 0.0
         self.tick()
-        for c, rid in job.get("waiters", []):
-            if c is None or c not in self.clients:
+        for c, rid in job["waiters"]:
+            if c not in self.clients:       # gone since, or autostart's None
                 continue
             m = {"type": "reply", "cmd": "vm_" + job["kind"], "ok": ok}
             if rid is not None:
@@ -1154,6 +1160,7 @@ class Daemon:
                 self.status[key] = "waiting-vm" if key in present else "unplugged"
             self.unattached_since.clear()
             self.recreate.clear()
+            self.add_failed.clear()
             return
 
         # Removals that failed while the VM was unreachable.
@@ -1202,15 +1209,14 @@ class Daemon:
                 # by vendor:product the moment it comes back.
                 self.status[key] = "unplugged"
                 self.unattached_since.pop(key, None)
-                self.retry_at.pop(key, None)
+                self.add_failed.pop(key, None)
                 continue
             if qid in attached:
                 self.status[key] = "attached"
                 self.detail[key] = ""
                 self.unattached_since.pop(key, None)
                 self.recreate.discard(key)
-                self.retry_at.pop(key, None)
-                self.last_add_error.pop(key, None)
+                self.add_failed.pop(key, None)
                 continue
             # Present on the host but not in the guest.
             if not vm.sees_device(dev):
@@ -1218,7 +1224,8 @@ class Daemon:
                 self.detail[key] = "the VM was started without USB access; restart Windows"
                 continue
             since = self.unattached_since.setdefault(key, now)
-            if now < self.retry_at.get(key, 0.0):
+            failed = self.add_failed.get(key)
+            if failed and now < failed[0]:
                 continue            # QEMU refused it a moment ago; not every tick
             if key in self.recreate:
                 # A deleted qdev may take a moment to go; keep trying to add.
@@ -1274,9 +1281,9 @@ class Daemon:
         """QEMU refused a device_add.  Say so once (not every two seconds)
         and try again later rather than every tick: a device QEMU cannot
         open must not turn into a monitor command storm."""
-        self.retry_at[key] = now + ADD_RETRY_SECONDS
-        if self.last_add_error.get(key) != err:
-            self.last_add_error[key] = err
+        before = self.add_failed.get(key)
+        self.add_failed[key] = (now + ADD_RETRY_SECONDS, err)
+        if before is None or before[1] != err:
             log.warning("device_add %s failed: %s", key, err)
 
     def qemu_add(self, key, dev):

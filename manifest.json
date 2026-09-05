@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.mechanicsunlocked.winplug",
   "name": "Winplug",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": "Sven Mathieu",
   "license": "MIT",
   "description": "Send USB devices to the Omarchy Windows VM from the bar, and take them back. Dongles, car and bike interfaces: hot-plug safe, native QEMU passthrough, no VM restart.",

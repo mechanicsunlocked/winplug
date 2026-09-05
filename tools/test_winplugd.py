@@ -2,6 +2,12 @@
 """Unit tests for the pure parts of winplugd (no root, no VM)."""
 import os, sys, json, tempfile, unittest, importlib.util, importlib.machinery, stat, socket, threading, subprocess, time
 
+# Never write __pycache__ into the plugin directory: Omarchy's shell reloads
+# the plugin on any file change there, and a reload while the screen is
+# locked strands the lock screen (the user is locked out).
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 here = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("winplugd", os.path.join(here, "..", "system", "winplugd.py"))
 w = importlib.util.module_from_spec(spec); spec.loader.exec_module(w)
@@ -224,7 +230,22 @@ class Launcher(unittest.TestCase):
         cfg = w.Config(conf)
         cfg.socket = os.path.join(d, "run", "winplug.sock")
         cfg.state = os.path.join(d, "state.json")
-        return cfg, w.Daemon(cfg)
+        dm = w.Daemon(cfg)
+        self.addCleanup(os.close, dm.wake_r)
+        self.addCleanup(os.close, dm.wake_w)
+        return cfg, dm
+
+    def client(self, dm):
+        """A connected client as the daemon sees it, and our end of it."""
+        c, peer = socket.socketpair()
+        dm.clients[c] = {"buf": b""}
+        self.addCleanup(c.close)
+        self.addCleanup(peer.close)
+        peer.settimeout(2)
+        return c, peer
+
+    def replies(self, peer):
+        return [m for m in (json.loads(l) for l in peer.recv(65536).decode().split("\n") if l) if m.get("type") == "reply"]
 
     def test_tool_trusted(self):
         self.assertTrue(w.tool_trusted("/usr/bin/env"))       # root-owned, 0755, in root-owned dirs
@@ -288,8 +309,7 @@ class Launcher(unittest.TestCase):
             cfg.uid = os.getuid(); cfg.vm_runner = "direct"; cfg.vm_tool = "/usr/bin/true"
             cfg.container_pid_override = "2147483647"; cfg.compose = os.path.join(d, "none.yml")
             dm.launcher_ok = True
-            a, a_peer = socket.socketpair(); b, b_peer = socket.socketpair()
-            dm.clients[a] = {"buf": b""}; dm.clients[b] = {"buf": b""}
+            a, a_peer = self.client(dm); b, b_peer = self.client(dm)
             self.assertEqual(dm.start_job("up", a, 1), "")
             self.assertEqual(dm.start_job("up", b, 2), "")
             self.assertEqual(dm.start_job("down", b, 3), "Windows is already being started")
@@ -297,25 +317,31 @@ class Launcher(unittest.TestCase):
             dm.finish_job()
             self.assertIsNone(dm.job)
             for peer, rid in ((a_peer, 1), (b_peer, 2)):
-                peer.settimeout(2)
-                lines = [json.loads(l) for l in peer.recv(65536).decode().split("\n") if l]
-                replies = [m for m in lines if m.get("type") == "reply"]
-                self.assertEqual([(m["ok"], m["id"]) for m in replies], [(True, rid)])
-            for s in (a, b, a_peer, b_peer):
-                s.close()
-            os.close(dm.wake_r); os.close(dm.wake_w)
+                self.assertEqual([(m["ok"], m["id"]) for m in self.replies(peer)], [(True, rid)])
 
     def test_handle_never_raises(self):
         with tempfile.TemporaryDirectory() as d:
             cfg, dm = self.daemon(d)
-            c, peer = socket.socketpair(); dm.clients[c] = {"buf": b""}
+            c, peer = self.client(dm)
             dm.store.save = lambda: (_ for _ in ()).throw(RuntimeError("disk on fire"))
             dm.handle(c, {"cmd": "attach", "key": "1a86:7523", "id": 7})
-            peer.settimeout(2)
-            m = json.loads(peer.recv(65536).decode().split("\n")[0])
+            m = self.replies(peer)[0]
             self.assertEqual((m["ok"], m["id"]), (False, 7))
             self.assertIn("disk on fire", m["error"])
-            c.close(); peer.close(); os.close(dm.wake_r); os.close(dm.wake_w)
+
+    def test_refused_add_is_retried_slowly_and_forgotten_on_detach(self):
+        # After QEMU refuses a device, the daemon waits ADD_RETRY_SECONDS
+        # before asking again -- but a take-back or a replug starts afresh.
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d)
+            now = 1000.0
+            dm.note_add_failure("1a86:7523", "USB device not found", now)
+            until, err = dm.add_failed["1a86:7523"]
+            self.assertEqual((until, err), (now + w.ADD_RETRY_SECONDS, "USB device not found"))
+            dm.store.assigned["1a86:7523"] = {"name": "x", "added": 0}
+            c, peer = self.client(dm)
+            dm.handle(c, {"cmd": "detach", "key": "1a86:7523"})
+            self.assertNotIn("1a86:7523", dm.add_failed)
 
     def test_state_reports_job_and_autostart(self):
         with tempfile.TemporaryDirectory() as d:
@@ -341,10 +367,10 @@ class Rdp(unittest.TestCase):
         for rc in (131, 141, 147, 255):
             self.assertEqual(cli.session_ended_by(rc), "nobody")
         # Reopen after a reboot-like end, never after a takeover or a refusal.
+        for rc in (5, 7, 8, 9, 10):
+            self.assertIn(rc, cli.FINAL_RDP_EXITS)
         for rc in (1, 3, 4, 6, 12):
-            self.assertTrue(cli.reopen_after(rc))
-        for rc in (0, 2, 11, 5, 7, 8, 9, 10, 131):
-            self.assertFalse(cli.reopen_after(rc))
+            self.assertNotIn(rc, cli.FINAL_RDP_EXITS)
 
     def test_rdp_answers_only_for_a_real_listener(self):
         srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(2)

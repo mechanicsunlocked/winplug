@@ -65,19 +65,27 @@ STATUS_TEXT = {
 }
 
 
+def send_notification(headline, body="", urgency="normal"):
+    """A desktop notification, when a notifier exists; silent otherwise.  One
+    replace-id, so a stream of progress lines updates one bubble."""
+    tool = shutil.which("omarchy-notification-send") or shutil.which("notify-send")
+    if not tool:
+        return
+    argv = [tool, "--app-name", "Winplug", "-u", urgency, "-r", "91733", headline]
+    if body:
+        argv.append(body)
+    try:
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
 def die(msg, code=1):
     print("winplug: " + msg, file=sys.stderr)
+    # Started from the app entry or the bar: nobody sees stderr, so the
+    # reason has to arrive as a notification or it arrives nowhere.
     if not sys.stderr.isatty():
-        # Started from the app entry or the bar: nobody sees stderr, so the
-        # reason has to arrive as a notification or it arrives nowhere.
-        tool = shutil.which("omarchy-notification-send") or shutil.which("notify-send")
-        if tool:
-            try:
-                subprocess.Popen([tool, "--app-name", "Winplug", "-u", "critical", "-r", "91733",
-                                  "Winplug", msg.split("\n")[0]],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except OSError:
-                pass
+        send_notification("Winplug", msg.split("\n")[0], "critical")
     sys.exit(code)
 
 
@@ -263,23 +271,13 @@ class Say:
 
     def __init__(self):
         self.tty = sys.stderr.isatty()
-        self.tool = shutil.which("omarchy-notification-send") or shutil.which("notify-send")
 
     def __call__(self, headline, body="", urgency="normal", notify=None):
         print(headline + ((": " + body) if body else ""), file=sys.stderr)
-        if not self.tool:
-            return
         if notify is None:
             notify = not self.tty
-        if not notify:
-            return
-        argv = [self.tool, "--app-name", "Winplug", "-u", urgency, "-r", "91733", headline]
-        if body:
-            argv.append(body)
-        try:
-            subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError:
-            pass
+        if notify:
+            send_notification(headline, body, urgency)
 
 
 # Windows client editions allow one interactive session per user, so a second
@@ -393,11 +391,6 @@ def session_ended_by(rc):
 # 9 privileges, 10 fresh credentials).  Reopening would only take the session
 # back from whoever has it now, or fail the same way again.
 FINAL_RDP_EXITS = (5, 7, 8, 9, 10)
-
-
-def reopen_after(rc):
-    """Whether a session Windows ended is worth waiting for and reopening."""
-    return session_ended_by(rc) == "windows" and rc not in FINAL_RDP_EXITS
 
 
 def read_credentials():
@@ -527,7 +520,7 @@ def cmd_launch(args):
                 say("Windows stopped answering", "it is left running", "critical", notify=True)
                 return 1
             continue
-        if not reopen_after(rc):
+        if rc in FINAL_RDP_EXITS:
             say("Windows ended the session",
                 "xfreerdp3 exit code %d: another client took it over, or Windows refused the connection; not reopening" % rc)
             break
