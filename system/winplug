@@ -67,7 +67,11 @@ STATUS_TEXT = {
 
 def send_notification(headline, body="", urgency="normal"):
     """A desktop notification, when a notifier exists; silent otherwise.  One
-    replace-id, so a stream of progress lines updates one bubble."""
+    replace-id, so a stream of progress lines updates one bubble.  The test
+    suites set WINPLUG_NO_NOTIFY so their deliberate failures stay off the
+    desktop."""
+    if os.environ.get("WINPLUG_NO_NOTIFY"):
+        return
     tool = shutil.which("omarchy-notification-send") or shutil.which("notify-send")
     if not tool:
         return

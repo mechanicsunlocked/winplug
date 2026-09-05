@@ -9,8 +9,9 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/winplug-test.XXXXXX")
 # Nothing may be written into the plugin directory (Omarchy reloads the
-# plugin on any change there, which strands a locked screen).
-export PYTHONDONTWRITEBYTECODE=1
+# plugin on any change there, which strands a locked screen), and the
+# deliberate failures below must not pop up as desktop notifications.
+export PYTHONDONTWRITEBYTECODE=1 WINPLUG_NO_NOTIFY=1
 trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$work"' EXIT
 
 fail=0
