@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """A stand-in for QEMU's human monitor, for testing winplugd without a VM.
 
-Speaks just enough HMP: banner + "(qemu) " prompt, echo of the command,
-`info usb`, `device_add usb-host,...`, `device_del <id>`.  A usb-host device
+Speaks just enough HMP: banner + "(qemu) " prompt, QEMU's readline echo (a
+redraw of the line after every byte, escape sequences and all -- the real
+monitor does this over a socket too, and a parser that expects a clean echo
+takes a successful device_add for an error), `info usb`,
+`device_add usb-host,...`, `device_del <id>`.  A usb-host device
 counts as attached to the guest only while a matching device exists in the
 fake host list, which is controlled through a side channel:
 
@@ -65,7 +68,26 @@ def control(line):
     if parts[0] == "dump": return json.dumps({"host": sorted(host), "qdevs": qdevs, "attached": attached_ids(), "log": log[-20:], "total": len(log), "total_del": sum(1 for c in log if c.strip().startswith("device_del"))}) + "\n"
     return "?\n"
 
-client = None; buf = b""
+line = bytearray(); shown = 0
+
+def readline_byte(ch):
+    """QEMU's util/readline.c as seen on the wire.  Every byte is answered
+    with a redraw of the line so far: cursor-left once per character already
+    shown, the buffer, erase-to-end-of-line.  Enter prints a newline, runs the
+    command, prints its output and a fresh prompt."""
+    global line, shown
+    if ch in (10, 13):
+        cmd = line.decode(errors="replace").strip(); line = bytearray(); shown = 0
+        out = run(cmd).replace("\n", "\r\n")
+        return ("\r\n" + out + "(qemu) ").encode()
+    if ch < 32:
+        return b""
+    line.append(ch)
+    out = b"\x1b[D" * shown + bytes(line) + b"\x1b[K"
+    shown = len(line)
+    return out
+
+client = None
 while True:
     rl = [mon, ctl] + ([client] if client else [])
     r, _, _ = select.select(rl, [], [])
@@ -77,15 +99,12 @@ while True:
             c, _ = mon.accept()
             if client:  # QEMU leaves extra clients waiting; we just queue one
                 c.close(); continue
-            client = c; buf = b""
+            client = c; line = bytearray(); shown = 0
             client.sendall(b"QEMU 10.0.0 monitor - type 'help' for more information\r\n(qemu) ")
         else:
             data = client.recv(4096)
             if not data:
                 client.close(); client = None; continue
-            buf += data
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                cmd = line.decode().strip()
-                out = run(cmd).replace("\n", "\r\n")
-                client.sendall((cmd + "\r\n" + out + "(qemu) ").encode())
+            out = b"".join(readline_byte(ch) for ch in data)
+            if out:
+                client.sendall(out)

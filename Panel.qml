@@ -38,10 +38,7 @@ Panel {
   // ---- helper connection --------------------------------------------------
 
   property var helperState: null
-  // Quickshell's Socket notifies `connected` through connectionStateChanged,
-  // so bind to the property rather than listening for a connectedChanged
-  // handler that never fires.
-  readonly property bool helperConnected: sock.connected
+  readonly property bool helperConnected: link.connected
   // Optimistic per-device marker so a row moves the instant it is clicked
   // rather than a round trip later.  Cleared by the next state push.
   property var pending: ({})
@@ -83,39 +80,15 @@ Panel {
     return out
   }
 
-  Socket {
-    id: sock
+  // The connection itself, with its retry and re-dial logic, lives in
+  // HelperLink.qml (which tools/test-reconnect.sh exercises against a helper
+  // that is stopped, killed and restarted).  The helper pushes the full
+  // state on connect and after every change.
+  HelperLink {
+    id: link
     path: root.socketPath
-    parser: SplitParser {
-      onRead: function(line) { root.onLine(line) }
-    }
-    onConnectionStateChanged: {
-      if (!connected) { root.helperState = null; root.pending = ({}) }
-    }
-    // The path comes from shell.json, which the bar injects a moment after
-    // the widget is created; the first attempt may have used the default.
-    onPathChanged: Qt.callLater(root.reconnect)
-  }
-
-  // The helper may not be installed yet, or may restart (e.g. an upgrade);
-  // keep knocking until the socket answers again.
-  Timer {
-    interval: 2000
-    repeat: true
-    running: !sock.connected
-    triggeredOnStart: true
-    onTriggered: root.reconnect()
-  }
-
-  // Quickshell keeps the *requested* connected state, and a synchronous
-  // false-then-true in one tick is coalesced, so the dial never restarts and
-  // a helper that was restarted is never picked back up.  Drop the request
-  // this event-loop turn, re-assert it the next, so the two writes are seen
-  // as a real transition.
-  function reconnect() {
-    if (sock.connected) return
-    sock.connected = false
-    Qt.callLater(function() { if (!sock.connected) sock.connected = true })
+    onLine: function(text) { root.onLine(text) }
+    onConnectedChanged: if (!connected) { root.helperState = null; root.pending = ({}) }
   }
 
   function onLine(line) {
@@ -135,9 +108,7 @@ Panel {
   }
 
   function request(obj) {
-    if (!sock.connected) return
-    sock.write(JSON.stringify(obj) + "\n")
-    sock.flush()
+    link.send(JSON.stringify(obj) + "\n")
   }
 
   function setPending(key, what) {

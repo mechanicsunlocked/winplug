@@ -207,14 +207,16 @@ through. Two honest notes:
 
 ```
 Panel.qml              the bar widget and popup (Quickshell, Omarchy's UI kit)
+HelperLink.qml         the widget's connection to winplugd; redials with a fresh socket
+                       whenever the helper goes away (upgrade, crash, not installed yet)
 manifest.json          Omarchy plugin manifest
 install.sh             user half: enable the widget, point the Windows app entry at winplug
 system/winplugd.py     root service: udev watch, QEMU monitor, compose patch, VM start/stop
 system/winplug         CLI and launcher
 system/install.sh      root half: service, config, CLI (--autostart)
 system/uninstall.sh    root half removal, restores the compose
-tools/                 tests: unit tests and an end-to-end run against a fake QEMU monitor
-                       and a fake omarchy-windows-vm
+tools/                 tests: unit tests, an end-to-end run against a fake QEMU monitor
+                       and a fake omarchy-windows-vm, and a reconnect test for the widget
 ```
 
 `winplugd` keeps its assignments in `/var/lib/winplug/state.json` and listens
@@ -234,9 +236,16 @@ to turn this off.)
 ## Tests
 
 ```bash
-python3 tools/test_winplugd.py    # compose patching, sysfs and HMP parsing, launcher checks, RDP probe
+python3 tools/test_winplugd.py    # compose patching, sysfs and monitor parsing (incl. a captured QEMU echo), launcher checks, RDP probe
 tools/test-daemon.sh              # the daemon against a fake QEMU monitor and a fake launcher, as a normal user
+tools/test-reconnect.sh           # the widget's link to the helper across a helper stop, crash and restart (needs a Wayland session)
 ```
+
+The fake monitor echoes like the real one: QEMU's monitor is a readline that
+redraws the line after every byte it receives, escape sequences and all, so
+a parser that expects a clean echo takes a successful `device_add` for an
+error. `tools/fixtures/` holds a reply captured from a real VM for the unit
+test.
 
 ## License
 

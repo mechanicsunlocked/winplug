@@ -263,6 +263,8 @@ class HmpError(Exception):
 
 
 PROMPT = b"(qemu) "
+# CSI sequences: ESC [ parameters intermediates final.
+ANSI_ESCAPE = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 def hmp(path, command, timeout=5.0):
@@ -271,6 +273,8 @@ def hmp(path, command, timeout=5.0):
     One short-lived connection per command.  The container's own shutdown
     handler uses the same socket, and QEMU serves one client at a time, so a
     connection that is held open would block the VM from powering down."""
+    if "\n" in command or "\r" in command:
+        raise HmpError("command must be a single line")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
@@ -285,10 +289,26 @@ def hmp(path, command, timeout=5.0):
             s.close()
         except OSError:
             pass
-    text = out[: -len(PROMPT)].decode(errors="replace").replace("\r", "")
+    return hmp_output(out, command)
+
+
+def hmp_output(raw, command):
+    """What the command printed, out of everything the monitor sent back.
+
+    QEMU's monitor is a readline: it echoes every byte it receives with a
+    terminal-style redraw -- cursor-left for each character shown so far, the
+    whole line again, erase-to-end-of-line -- so the reply to a 90-byte
+    device_add opens with some 14 KB of escape sequences before the first
+    newline.  With the escapes stripped, that echo is every prefix of the
+    command run together, ending in the command itself.  Drop it by its tail
+    (a monitor that echoes plainly, or not at all, is handled the same way),
+    and what is left up to the prompt is the command's own output."""
+    if raw.endswith(PROMPT):
+        raw = raw[: -len(PROMPT)]
+    text = ANSI_ESCAPE.sub(b"", raw).decode(errors="replace").replace("\r", "")
     lines = text.split("\n")
-    # readline echoes the command back on the first line.
-    if lines and lines[0].strip() == command.strip():
+    cmd = command.strip()
+    if lines and cmd and lines[0].strip().endswith(cmd):
         lines = lines[1:]
     return "\n".join(l for l in lines if l.strip() != "").strip()
 

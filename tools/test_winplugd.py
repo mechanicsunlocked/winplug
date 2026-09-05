@@ -74,7 +74,65 @@ class Compose(unittest.TestCase):
         out = subprocess.run(["awk", "-f", os.path.join(here, "..", "system", "compose-unpatch.awk")], input=patched, capture_output=True, text=True).stdout
         self.assertEqual(out, OMARCHY_COMPOSE)
 
+def readline_echo(cmd):
+    """QEMU's readline on the wire: a redraw of the line after every byte."""
+    out = b""; shown = 0
+    for i in range(1, len(cmd) + 1):
+        out += b"\x1b[D" * shown + cmd[:i].encode() + b"\x1b[K"; shown = i
+    return out
+
 class Hmp(unittest.TestCase):
+    def test_output_strips_readline_echo(self):
+        cmd = "device_add usb-host,vendorid=0x1a86,productid=0x7523,id=winplug-1a86-7523,bus=xhci.0"
+        # Success: nothing but the echo comes back.
+        self.assertEqual(w.hmp_output(readline_echo(cmd) + b"\r\n(qemu) ", cmd), "")
+        # An error after the echo survives intact.
+        raw = readline_echo(cmd) + b"\r\nDuplicate device ID 'winplug-1a86-7523'\r\n(qemu) "
+        self.assertEqual(w.hmp_output(raw, cmd), "Duplicate device ID 'winplug-1a86-7523'")
+        # A monitor that echoes plainly, or not at all.
+        self.assertEqual(w.hmp_output(cmd.encode() + b"\r\nBus 'xhci.0' not found\r\n(qemu) ", cmd), "Bus 'xhci.0' not found")
+        self.assertEqual(w.hmp_output(b"Bus 'xhci.0' not found\r\n(qemu) ", cmd), "Bus 'xhci.0' not found")
+        # Multi-line output keeps every line.
+        usb = ("  Device 0.1, Port 1, Speed 480 Mb/s, Product QEMU USB Tablet, ID: usb-tablet\r\n"
+               "  Device 0.2, Port 2, Speed 12 Mb/s, Product USB2.0-Serial, ID: winplug-1a86-7523\r\n")
+        out = w.hmp_output(readline_echo("info usb") + b"\r\n" + usb.encode() + b"(qemu) ", "info usb")
+        self.assertEqual(w.parse_info_usb(out), {"usb-tablet", "winplug-1a86-7523"})
+        self.assertEqual(out.count("\n"), 1)
+
+    def test_output_on_a_real_qemu_echo(self):
+        # Captured from the QEMU behind dockur/windows on 2026-09-05: the
+        # reply to a device_add that succeeded -- 14 KB of redraw, no output.
+        with open(os.path.join(here, "fixtures", "hmp-echo-device_add.bin"), "rb") as f:
+            raw = f.read()
+        cmd = "device_add usb-host,vendorid=0x32ac,productid=0x001d,id=winplug-32ac-001d,bus=xhci.0"
+        self.assertTrue(raw.endswith(cmd.encode() + b"\x1b[K"))
+        self.assertEqual(w.hmp_output(raw + b"\r\n(qemu) ", cmd), "")
+        self.assertEqual(w.hmp_output(raw + b"\r\nDevice 'winplug-32ac-001d' not found\r\n(qemu) ", cmd),
+                         "Device 'winplug-32ac-001d' not found")
+
+    def test_hmp_end_to_end_against_a_readline_monitor(self):
+        d = tempfile.mkdtemp(); path = os.path.join(d, "monitor.sock")
+        srv = socket.socket(socket.AF_UNIX); srv.bind(path); srv.listen(2)
+        def serve(reply):
+            c, _ = srv.accept()
+            c.sendall(b"QEMU 10.0.0 monitor - type 'help' for more information\r\n(qemu) ")
+            buf = b""
+            while b"\n" not in buf:
+                buf += c.recv(4096)
+            cmd = buf.split(b"\n", 1)[0].decode()
+            c.sendall(readline_echo(cmd) + b"\r\n" + reply + b"(qemu) ")
+            c.close()
+        cmd = "device_del winplug-1a86-7523"
+        t = threading.Thread(target=serve, args=(b"",)); t.start()
+        self.assertEqual(w.hmp(path, cmd, timeout=3), ""); t.join()
+        t = threading.Thread(target=serve, args=(b"Device 'winplug-1a86-7523' not found\r\n",)); t.start()
+        self.assertEqual(w.hmp(path, cmd, timeout=3), "Device 'winplug-1a86-7523' not found"); t.join()
+        srv.close()
+        with self.assertRaises(w.HmpError):
+            w.hmp(path, "info usb", timeout=1)                 # nobody listening
+        with self.assertRaises(w.HmpError):
+            w.hmp(path, "info usb\nquit", timeout=1)           # never send a second line
+
     def test_parse_info_usb(self):
         txt = ("  Device 0.1, Port 1, Speed 480 Mb/s, Product QEMU USB Tablet, ID: usb-tablet\n"
                "  Device 0.2, Port 2, Speed 12 Mb/s, Product USB2.0-Serial, ID: winplug-1a86-7523\n")
