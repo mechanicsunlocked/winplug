@@ -79,6 +79,9 @@ NO_ACCESS_AFTER_SECONDS = 12.0
 # and shutdown handling use the same monitor, so the less it is shared, the
 # better.
 ATTACHED_POLL_SECONDS = 5.0
+# After QEMU refused a device_add outright (not the "Duplicate" case, which
+# has its own clock above), wait this long before asking again.
+ADD_RETRY_SECONDS = 10.0
 IDLE_AUDIT_SECONDS = float(os.environ.get("WINPLUG_AUDIT_SECONDS", "60"))
 # How long the VM start / stop actions may run.  Start includes Omarchy's own
 # mount preparation and `docker compose up`; stop waits for the guest to power
@@ -176,52 +179,65 @@ def enumerate_usb(sysfs):
         # root hubs like "usb3".
         if not re.fullmatch(r"\d+-[\d.]+", name):
             continue
-        d = os.path.join(sysfs, name)
-        vid = _read(d + "/idVendor").lower()
-        pid = _read(d + "/idProduct").lower()
-        if not re.fullmatch(r"[0-9a-f]{4}", vid) or not re.fullmatch(r"[0-9a-f]{4}", pid):
-            continue
-        dev_class = _read(d + "/bDeviceClass")
-        if dev_class == "09":       # hub
-            continue
-        drivers = set()
-        for entry in os.listdir(d) if os.path.isdir(d) else []:
-            if re.fullmatch(re.escape(name) + r":\d+\.\d+", entry):
-                drv = os.path.join(d, entry, "driver")
-                if os.path.islink(drv):
-                    drivers.add(os.path.basename(os.readlink(drv)))
-        manufacturer = _read(d + "/manufacturer")
-        product = _read(d + "/product")
-        serial = _read(d + "/serial")
         try:
-            busnum = int(_read(d + "/busnum") or 0)
-            devnum = int(_read(d + "/devnum") or 0)
-        except ValueError:
-            busnum = devnum = 0
-        key = device_key(vid, pid)
-        entry = {
-            "key": key,
-            "vid": vid,
-            "pid": pid,
-            "manufacturer": manufacturer,
-            "product": product,
-            "serial": serial,
-            "speed": _read(d + "/speed"),
-            "bus": busnum,
-            "dev": devnum,
-            "port": name.split("-", 1)[1],
-            "sysname": name,
-            "class": dev_class,
-            "drivers": sorted(drivers),
-            "count": 1,
-        }
-        entry["name"] = display_name(entry)
-        entry["tags"] = tags_for(entry)
+            entry = _usb_entry(sysfs, name)
+        except OSError:
+            continue                # unplugged while we were looking
+        if entry is None:
+            continue
+        key = entry["key"]
         if key in devices:
             devices[key]["count"] += 1
         else:
             devices[key] = entry
     return devices
+
+
+def _usb_entry(sysfs, name):
+    """One device's sysfs attributes; None for a hub or an incomplete entry.
+    Raises OSError if the device disappears mid-read (this is a hot-plug
+    daemon: a directory listed a moment ago may be gone by now)."""
+    d = os.path.join(sysfs, name)
+    vid = _read(d + "/idVendor").lower()
+    pid = _read(d + "/idProduct").lower()
+    if not re.fullmatch(r"[0-9a-f]{4}", vid) or not re.fullmatch(r"[0-9a-f]{4}", pid):
+        return None
+    dev_class = _read(d + "/bDeviceClass")
+    if dev_class == "09":       # hub
+        return None
+    drivers = set()
+    for entry in os.listdir(d) if os.path.isdir(d) else []:
+        if re.fullmatch(re.escape(name) + r":\d+\.\d+", entry):
+            drv = os.path.join(d, entry, "driver")
+            if os.path.islink(drv):
+                drivers.add(os.path.basename(os.readlink(drv)))
+    manufacturer = _read(d + "/manufacturer")
+    product = _read(d + "/product")
+    serial = _read(d + "/serial")
+    try:
+        busnum = int(_read(d + "/busnum") or 0)
+        devnum = int(_read(d + "/devnum") or 0)
+    except ValueError:
+        busnum = devnum = 0
+    entry = {
+        "key": device_key(vid, pid),
+        "vid": vid,
+        "pid": pid,
+        "manufacturer": manufacturer,
+        "product": product,
+        "serial": serial,
+        "speed": _read(d + "/speed"),
+        "bus": busnum,
+        "dev": devnum,
+        "port": name.split("-", 1)[1],
+        "sysname": name,
+        "class": dev_class,
+        "drivers": sorted(drivers),
+        "count": 1,
+    }
+    entry["name"] = display_name(entry)
+    entry["tags"] = tags_for(entry)
+    return entry
 
 
 def display_name(d):
@@ -569,8 +585,11 @@ class Store:
             with open(self.path) as f:
                 data = json.load(f)
             self.assigned = {k: v for k, v in data.get("assigned", {}).items()
-                             if re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", k)}
-        except (OSError, ValueError):
+                             if re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", k) and isinstance(v, dict)}
+        except (OSError, ValueError, TypeError, AttributeError):
+            # Unreadable or not the shape we wrote: start empty rather than
+            # not at all.  The next assignment rewrites the file.
+            log.warning("state file %s is unusable; starting with no assignments", self.path)
             self.assigned = {}
 
     def save(self):
@@ -615,6 +634,8 @@ class Daemon:
         self.last_poll = 0.0         # last `info usb`
         self.audited_pid = 0         # container pid the leftover audit last ran for
         self.pending_removal = set() # device_del that failed; retried when the VM is back
+        self.retry_at = {}           # key -> monotonic time before which a failed device_add is not retried
+        self.last_add_error = {}     # key -> the error last logged for it
         # VM start/stop: one job at a time, run by a worker thread, finished
         # on the main thread through the wake pipe.
         self.job = None
@@ -804,6 +825,18 @@ class Daemon:
             self.send(c, msg)
 
     def handle(self, c, req):
+        # A request must never take the daemon (and with it every assigned
+        # device's bookkeeping) down: whatever goes wrong becomes a reply.
+        try:
+            self._handle(c, req)
+        except Exception as e:
+            log.exception("request %r failed", req.get("cmd"))
+            m = {"type": "reply", "cmd": req.get("cmd"), "ok": False, "error": "internal error: %s" % e}
+            if req.get("id") is not None:
+                m["id"] = req.get("id")
+            self.send(c, m)
+
+    def _handle(self, c, req):
         cmd = req.get("cmd")
         rid = req.get("id")
         def reply(ok, error="", **extra):
@@ -823,7 +856,10 @@ class Daemon:
                 return reply(False, "key must look like 1a2b:3c4d")
             present = enumerate_usb(self.cfg.sysfs)
             name = req.get("name") or (present[key]["name"] if key in present else key)
-            self.store.assigned[key] = {"name": str(name)[:120], "added": time.time()}
+            # The name is shown in the panel and written to the log: printable
+            # characters only, and not endless.
+            name = "".join(ch for ch in str(name) if ch.isprintable()).strip()[:120] or key
+            self.store.assigned[key] = {"name": name, "added": time.time()}
             self.store.save()
             self.unattached_since.pop(key, None)
             log.info("assigned %s (%s)", key, name)
@@ -904,13 +940,18 @@ class Daemon:
         """Start `omarchy-windows-vm __priv <kind>` in the background.  Returns
         an error string, empty when the job is running."""
         if self.job:
+            if self.job["kind"] == kind:
+                # The same thing is already under way (autostart, or a second
+                # click): this caller gets its answer when that one finishes.
+                self.job["waiters"].append((c, rid))
+                return ""
             return "Windows is already being %s" % ("started" if self.job["kind"] == "up" else "stopped")
         if not self.launcher_ok:
             return "%s is not a root-owned launcher; refusing to run it as root" % self.cfg.vm_tool
         if self.cfg.uid is None:
             return "no user configured in winplug.conf"
         argv = self.job_argv(kind)
-        job = {"kind": kind, "client": c, "rid": rid, "result": None, "started": time.monotonic()}
+        job = {"kind": kind, "waiters": [(c, rid)], "result": None, "started": time.monotonic()}
         t = threading.Thread(target=self.run_job, args=(job, argv), daemon=True)
         job["thread"] = t
         self.job = job
@@ -954,11 +995,12 @@ class Daemon:
             log.warning("Windows %s failed (rc %s): %s", verb, rc, err or "no output")
         self.vm._last_docker = 0.0
         self.tick()
-        c = job["client"]
-        if c is not None and c in self.clients:
+        for c, rid in job.get("waiters", []):
+            if c is None or c not in self.clients:
+                continue
             m = {"type": "reply", "cmd": "vm_" + job["kind"], "ok": ok}
-            if job["rid"] is not None:
-                m["id"] = job["rid"]
+            if rid is not None:
+                m["id"] = rid
             if not ok:
                 m["error"] = err or "%s failed (exit %s)" % (verb, rc)
             self.send(c, m)
@@ -1040,6 +1082,12 @@ class Daemon:
     # -- periodic work -----------------------------------------------------
 
     def tick(self):
+        try:
+            self._tick()
+        except Exception:      # never let one bad tick kill the daemon
+            log.exception("tick failed")
+
+    def _tick(self):
         now = time.monotonic()
         if self.autostart_at and now >= self.autostart_at:
             self.autostart_at = 0.0
@@ -1051,10 +1099,7 @@ class Daemon:
         if self.cfg.fix_home_modes and now - self.home_checked > 5:
             self.home_checked = now
             self.fix_home_modes()
-        try:
-            self.reconcile()
-        except Exception:      # never let one bad tick kill the daemon
-            log.exception("reconcile failed")
+        self.reconcile()
         self.broadcast_state()
 
     def check_compose(self, force=False):
@@ -1157,12 +1202,15 @@ class Daemon:
                 # by vendor:product the moment it comes back.
                 self.status[key] = "unplugged"
                 self.unattached_since.pop(key, None)
+                self.retry_at.pop(key, None)
                 continue
             if qid in attached:
                 self.status[key] = "attached"
                 self.detail[key] = ""
                 self.unattached_since.pop(key, None)
                 self.recreate.discard(key)
+                self.retry_at.pop(key, None)
+                self.last_add_error.pop(key, None)
                 continue
             # Present on the host but not in the guest.
             if not vm.sees_device(dev):
@@ -1170,6 +1218,8 @@ class Daemon:
                 self.detail[key] = "the VM was started without USB access; restart Windows"
                 continue
             since = self.unattached_since.setdefault(key, now)
+            if now < self.retry_at.get(key, 0.0):
+                continue            # QEMU refused it a moment ago; not every tick
             if key in self.recreate:
                 # A deleted qdev may take a moment to go; keep trying to add.
                 err = self.qemu_add(key, dev)
@@ -1182,6 +1232,8 @@ class Daemon:
                 self.recreate.discard(key)
                 self.status[key] = "attaching" if not err else "error"
                 self.detail[key] = err
+                if err:
+                    self.note_add_failure(key, err, now)
                 continue
             err = self.qemu_add(key, dev)
             if not err:
@@ -1206,7 +1258,7 @@ class Daemon:
                 continue
             self.status[key] = "error"
             self.detail[key] = err
-            log.warning("device_add %s failed: %s", key, err)
+            self.note_add_failure(key, err, now)
 
         # Anything of ours in the guest that is no longer assigned goes away
         # (an unassign that happened while the VM was unreachable).
@@ -1217,6 +1269,15 @@ class Daemon:
                     log.info("removing stale %s from the guest", qid)
                     if self.qemu_remove(key):
                         self.pending_removal.add(key)
+
+    def note_add_failure(self, key, err, now):
+        """QEMU refused a device_add.  Say so once (not every two seconds)
+        and try again later rather than every tick: a device QEMU cannot
+        open must not turn into a monitor command storm."""
+        self.retry_at[key] = now + ADD_RETRY_SECONDS
+        if self.last_add_error.get(key) != err:
+            self.last_add_error[key] = err
+            log.warning("device_add %s failed: %s", key, err)
 
     def qemu_add(self, key, dev):
         """device_add; returns an error string, empty on success."""

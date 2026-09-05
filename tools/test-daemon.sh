@@ -117,6 +117,18 @@ a=$(polls); sleep 6.5; b=$(polls)
 (( b - a <= 3 )) && pass "$((b - a)) commands in 6.5s with a device attached and idle (${ATTACHED:-5}s heartbeat)" || flunk "attached device polled too often: $((b - a)) in 6.5s"
 cli remove 0403:6001 >/dev/null
 
+echo "8b. QEMU refuses a device outright: one warning, a slow retry, no command storm"
+add_count() { dump | python3 -c 'import json,sys; print(json.load(sys.stdin)["total_add"])'; }
+ctl refuse_add 1 >/dev/null
+cli add 0403:6001 >/dev/null
+wait_status 0403:6001 error 40 && pass "refused device shows 'error'" || flunk "state: $(status_of 0403:6001)"
+a=$(add_count); sleep 6.5; b=$(add_count)
+(( b - a <= 1 )) && pass "$((b - a)) device_add in 6.5s while refused (retry every ${ADD_RETRY:-10}s)" || flunk "device_add storm: $((b - a)) in 6.5s"
+(( $(grep -c 'device_add 0403:6001 failed' "$work/daemon.log") == 1 )) && pass "warned once" || flunk "warned $(grep -c 'device_add 0403:6001 failed' "$work/daemon.log") times"
+ctl refuse_add 0 >/dev/null
+wait_status 0403:6001 attached 80 && pass "attaches once QEMU accepts it" || flunk "state: $(status_of 0403:6001)"
+cli remove 0403:6001 >/dev/null
+
 echo "9. bad input"
 out=$(cli add nonsense 2>&1); grep -qi 'no device' <<<"$out" && pass "unknown device rejected" || flunk "bad input accepted: $out"
 printf '{"cmd":"attach","key":"../etc"}\n' | nc -U -q1 -w2 "$WINPLUG_SOCKET" | grep -q '"ok":false' && pass "malformed key rejected" || flunk "malformed key"

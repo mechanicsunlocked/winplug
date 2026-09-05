@@ -138,9 +138,15 @@ and you get a second password prompt for a shutdown you never asked for.
 Docker's port proxy accepts the TCP connection long before Windows does).
 
 If Windows ends the session itself (a reboot for updates, say), the launcher
-waits for it to come back and reopens the session. If the session was never
-made, Windows is left running and you are told why; it is never stopped
-behind your back.
+waits for it to come back and reopens the session. It does not do that when
+another RDP client took the session over or Windows refused the connection;
+reopening would only take the session back. If the session was never made,
+Windows is left running and you are told why; it is never stopped behind your
+back. Started from the app entry or the bar, anything that goes wrong arrives
+as a notification.
+
+If you click the icon while Windows is still coming up from autostart, the
+launch simply joins that start and opens the session when Windows answers.
 
 **Autostart.** `winplug autostart on` starts Windows at boot, in the
 background, and keeps it running when you close a session, so opening it is
@@ -190,6 +196,10 @@ through. Two honest notes:
 - The device is the guest's only while it is *In Windows*. Do not take it back
   mid-flash. Winplug will not do it for you either: assignments survive
   everything except your click.
+- Some flashers restart the device into a bootloader that shows up with a
+  *different* vendor:product id. While it is in that mode it appears in the
+  list as a new device; send that one to Windows too, once, and from then on
+  both ids follow the device through every flash.
 - USB *mass storage* can be handled either way; for a plain file exchange the
   `~/Windows` shared folder is simpler. And dockur's warning stands: never have
   a USB drive attached while Windows Setup is still running.

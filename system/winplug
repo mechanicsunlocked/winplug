@@ -67,6 +67,17 @@ STATUS_TEXT = {
 
 def die(msg, code=1):
     print("winplug: " + msg, file=sys.stderr)
+    if not sys.stderr.isatty():
+        # Started from the app entry or the bar: nobody sees stderr, so the
+        # reason has to arrive as a notification or it arrives nowhere.
+        tool = shutil.which("omarchy-notification-send") or shutil.which("notify-send")
+        if tool:
+            try:
+                subprocess.Popen([tool, "--app-name", "Winplug", "-u", "critical", "-r", "91733",
+                                  "Winplug", msg.split("\n")[0]],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
     sys.exit(code)
 
 
@@ -377,6 +388,18 @@ def session_ended_by(rc):
     return "windows"
 
 
+# Exit codes after which Windows is not coming back *for us*: another client
+# took the session over (5), or the server refused us (7 denied, 8 FIPS,
+# 9 privileges, 10 fresh credentials).  Reopening would only take the session
+# back from whoever has it now, or fail the same way again.
+FINAL_RDP_EXITS = (5, 7, 8, 9, 10)
+
+
+def reopen_after(rc):
+    """Whether a session Windows ended is worth waiting for and reopening."""
+    return session_ended_by(rc) == "windows" and rc not in FINAL_RDP_EXITS
+
+
 def read_credentials():
     """Omarchy's private RDP credentials, with its own fallback."""
     user = password = ""
@@ -504,8 +527,12 @@ def cmd_launch(args):
                 say("Windows stopped answering", "it is left running", "critical", notify=True)
                 return 1
             continue
-        # Windows ended the session itself: a reboot, a shutdown from inside,
-        # another session taking over.  Wait for it and open it again.
+        if not reopen_after(rc):
+            say("Windows ended the session",
+                "xfreerdp3 exit code %d: another client took it over, or Windows refused the connection; not reopening" % rc)
+            break
+        # Windows ended the session itself: a reboot, a shutdown from inside.
+        # Wait for it and open it again.
         say("Windows closed the session", "waiting for it to come back; the session reopens by itself")
         back = False
         deadline = time.monotonic() + RETURN_TIMEOUT

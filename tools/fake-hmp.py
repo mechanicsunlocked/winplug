@@ -29,6 +29,7 @@ ctl = socket.socket(socket.AF_UNIX); ctl.bind(ctl_path); ctl.listen(4)
 host = set()               # vid:pid present on the "host"
 qdevs = {}                 # id -> {"vid","pid","bus"}
 no_access = False
+refuse_add = False         # device_add fails outright (libusb could not open the device, say)
 log = []
 
 def attached_ids():
@@ -49,6 +50,7 @@ def run(cmd):
         vid, pid, i, bus = m.groups()
         if i in qdevs: return "Duplicate device ID '%s'\n" % i
         if bus and bus != "xhci.0": return "Bus '%s' not found\n" % bus
+        if refuse_add: return "Error: USB device not found or cannot be opened\n"
         qdevs[i] = {"vid": vid, "pid": pid, "bus": bus}
         return ""
     m = re.fullmatch(r"device_del ([\w.-]+)", cmd)
@@ -59,13 +61,16 @@ def run(cmd):
     return "unknown command: '%s'\n" % cmd
 
 def control(line):
-    global no_access
+    global no_access, refuse_add
     parts = line.split()
     if not parts: return ""
     if parts[0] == "plug": host.add(parts[1]); return "ok\n"
     if parts[0] == "unplug": host.discard(parts[1]); return "ok\n"
     if parts[0] == "noaccess": no_access = parts[1] == "1"; return "ok\n"
-    if parts[0] == "dump": return json.dumps({"host": sorted(host), "qdevs": qdevs, "attached": attached_ids(), "log": log[-20:], "total": len(log), "total_del": sum(1 for c in log if c.strip().startswith("device_del"))}) + "\n"
+    if parts[0] == "refuse_add": refuse_add = parts[1] == "1"; return "ok\n"
+    if parts[0] == "dump": return json.dumps({"host": sorted(host), "qdevs": qdevs, "attached": attached_ids(), "log": log[-20:], "total": len(log),
+                                              "total_del": sum(1 for c in log if c.strip().startswith("device_del")),
+                                              "total_add": sum(1 for c in log if c.strip().startswith("device_add"))}) + "\n"
     return "?\n"
 
 line = bytearray(); shown = 0

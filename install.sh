@@ -32,6 +32,7 @@ else
     mkdir -p "$plugin_dir/system"
     install -Dm644 "$here/manifest.json" "$plugin_dir/manifest.json"
     install -Dm644 "$here/Panel.qml"     "$plugin_dir/Panel.qml"
+    install -Dm644 "$here/HelperLink.qml" "$plugin_dir/HelperLink.qml"
     install -Dm755 "$here/system/install.sh"     "$plugin_dir/system/install.sh"
     install -Dm755 "$here/system/uninstall.sh"   "$plugin_dir/system/uninstall.sh"
     install -Dm755 "$here/system/winplugd.py"    "$plugin_dir/system/winplugd.py"

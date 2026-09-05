@@ -18,6 +18,16 @@ if [[ -f /etc/winplug/winplug.conf ]]; then
     [[ -n $c ]] && compose=$c
 fi
 
+# Take every assigned device back first, while the helper can still reach
+# QEMU; otherwise they would stay in the guest until Windows restarts.
+if systemctl is-active --quiet winplugd.service && [[ -x /usr/local/bin/winplug ]]; then
+    keys=$(/usr/local/bin/winplug list --json 2>/dev/null \
+        | python3 -c 'import json,sys; print(" ".join(d["key"] for d in json.load(sys.stdin)["devices"] if d.get("assigned")))' 2>/dev/null || true)
+    for key in $keys; do
+        /usr/local/bin/winplug remove "$key" || true
+    done
+fi
+
 systemctl disable --now winplugd.service 2>/dev/null || true
 rm -f /etc/systemd/system/winplugd.service
 systemctl daemon-reload

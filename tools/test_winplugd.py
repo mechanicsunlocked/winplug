@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for the pure parts of winplugd (no root, no VM)."""
-import os, sys, tempfile, unittest, importlib.util, importlib.machinery, stat, socket, threading, subprocess, time
+import os, sys, json, tempfile, unittest, importlib.util, importlib.machinery, stat, socket, threading, subprocess, time
 
 here = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("winplugd", os.path.join(here, "..", "system", "winplugd.py"))
@@ -181,6 +181,34 @@ class Sysfs(unittest.TestCase):
             self.assertEqual(e["count"], 2)
             self.assertEqual((e["bus"], e["dev"], e["port"]), (3, 9, "7"))
 
+    def test_enumerate_skips_what_it_cannot_read(self):
+        # A device that vanishes (or cannot be read) mid-scan must not take
+        # the whole scan, and with it the daemon, down.
+        if os.geteuid() == 0:
+            self.skipTest("root can read anything")
+        with tempfile.TemporaryDirectory() as root:
+            self.make(root, "3-7", idVendor="1a86", idProduct="7523", bDeviceClass="ff", product="ok", busnum="3", devnum="9")
+            bad = self.make(root, "3-8", idVendor="0403", idProduct="6001", bDeviceClass="00", product="gone", busnum="3", devnum="10")
+            os.chmod(bad, 0)
+            try:
+                devs = w.enumerate_usb(root)
+            finally:
+                os.chmod(bad, 0o755)
+            self.assertEqual(set(devs), {"1a86:7523"})
+            self.assertIsNone(w._usb_entry(root, "3-9"))       # a name that is not there at all
+            self.assertIsNotNone(w._usb_entry(root, "3-7"))
+
+    def test_store_survives_garbage(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "state.json")
+            for text in ("", "[]", "{\"assigned\": 3}", "{\"assigned\": {\"1a86:7523\": \"x\", \"zz\": {}}}", "not json"):
+                with open(p, "w") as f:
+                    f.write(text)
+                self.assertEqual(w.Store(p).assigned, {})
+            with open(p, "w") as f:
+                f.write("{\"assigned\": {\"1a86:7523\": {\"name\": \"dongle\"}}}")
+            self.assertEqual(list(w.Store(p).assigned), ["1a86:7523"])
+
     def test_real_sysfs_does_not_crash(self):
         devs = w.enumerate_usb("/sys/bus/usb/devices")
         for e in devs.values():
@@ -251,6 +279,44 @@ class Launcher(unittest.TestCase):
             self.assertEqual(self.read(cfg.path), "[winplug]\nautostart = false\n")
             self.assertFalse(os.path.exists(cfg.path + ".winplug.tmp"))
 
+    def test_same_job_twice_answers_both(self):
+        # Two "start" requests while one start is under way (autostart plus a
+        # click, or two clicks): both get the one job's answer, nobody gets
+        # "already being started".
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d)
+            cfg.uid = os.getuid(); cfg.vm_runner = "direct"; cfg.vm_tool = "/usr/bin/true"
+            cfg.container_pid_override = "2147483647"; cfg.compose = os.path.join(d, "none.yml")
+            dm.launcher_ok = True
+            a, a_peer = socket.socketpair(); b, b_peer = socket.socketpair()
+            dm.clients[a] = {"buf": b""}; dm.clients[b] = {"buf": b""}
+            self.assertEqual(dm.start_job("up", a, 1), "")
+            self.assertEqual(dm.start_job("up", b, 2), "")
+            self.assertEqual(dm.start_job("down", b, 3), "Windows is already being started")
+            dm.job["thread"].join(10)
+            dm.finish_job()
+            self.assertIsNone(dm.job)
+            for peer, rid in ((a_peer, 1), (b_peer, 2)):
+                peer.settimeout(2)
+                lines = [json.loads(l) for l in peer.recv(65536).decode().split("\n") if l]
+                replies = [m for m in lines if m.get("type") == "reply"]
+                self.assertEqual([(m["ok"], m["id"]) for m in replies], [(True, rid)])
+            for s in (a, b, a_peer, b_peer):
+                s.close()
+            os.close(dm.wake_r); os.close(dm.wake_w)
+
+    def test_handle_never_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d)
+            c, peer = socket.socketpair(); dm.clients[c] = {"buf": b""}
+            dm.store.save = lambda: (_ for _ in ()).throw(RuntimeError("disk on fire"))
+            dm.handle(c, {"cmd": "attach", "key": "1a86:7523", "id": 7})
+            peer.settimeout(2)
+            m = json.loads(peer.recv(65536).decode().split("\n")[0])
+            self.assertEqual((m["ok"], m["id"]), (False, 7))
+            self.assertIn("disk on fire", m["error"])
+            c.close(); peer.close(); os.close(dm.wake_r); os.close(dm.wake_w)
+
     def test_state_reports_job_and_autostart(self):
         with tempfile.TemporaryDirectory() as d:
             cfg, dm = self.daemon(d, "[winplug]\nautostart = true\n")
@@ -274,6 +340,11 @@ class Rdp(unittest.TestCase):
             self.assertEqual(cli.session_ended_by(rc), "windows")
         for rc in (131, 141, 147, 255):
             self.assertEqual(cli.session_ended_by(rc), "nobody")
+        # Reopen after a reboot-like end, never after a takeover or a refusal.
+        for rc in (1, 3, 4, 6, 12):
+            self.assertTrue(cli.reopen_after(rc))
+        for rc in (0, 2, 11, 5, 7, 8, 9, 10, 131):
+            self.assertFalse(cli.reopen_after(rc))
 
     def test_rdp_answers_only_for_a_real_listener(self):
         srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(2)
