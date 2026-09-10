@@ -93,26 +93,43 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+class HelperClosed(Exception):
+    """No helper to talk to: not running, restarting, or it hung up.  The
+    top level turns it into the usual message; `winplug launch` waits it
+    out where a restart (an upgrade) must not end a session."""
+
+
+class HelperTimeout(HelperClosed):
+    """The helper is there but did not answer in time."""
+
+
 class Client:
-    def __init__(self, path=SOCKET, timeout=5.0):
+    # The helper answers from its main thread, which may be inside a monitor
+    # command or a `docker inspect` (up to ~15 s) when we connect.
+    def __init__(self, path=SOCKET, timeout=20.0):
         self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.s.settimeout(timeout)
         try:
             self.s.connect(path)
         except FileNotFoundError:
-            die("helper socket %s is missing.\n  Is winplugd installed and running?  sudo systemctl status winplugd" % path)
+            raise HelperClosed("helper socket %s is missing.\n  Is winplugd installed and running?  sudo systemctl status winplugd" % path)
         except PermissionError:
-            die("no permission on %s.\n  The helper is configured for another user; check /etc/winplug/winplug.conf" % path)
+            raise HelperClosed("no permission on %s.\n  The helper is configured for another user; check /etc/winplug/winplug.conf" % path)
         except ConnectionRefusedError:
-            die("winplugd is not running.  sudo systemctl start winplugd")
+            raise HelperClosed("winplugd is not running.  sudo systemctl start winplugd")
         self.buf = b""
         self.state = None
 
     def read(self):
         while b"\n" not in self.buf:
-            chunk = self.s.recv(65536)
+            try:
+                chunk = self.s.recv(65536)
+            except socket.timeout:
+                raise HelperTimeout("the helper did not answer within %.0f s" % (self.s.gettimeout() or 0))
+            except OSError as e:
+                raise HelperClosed("the helper connection failed: %s" % e)
             if not chunk:
-                die("helper closed the connection")
+                raise HelperClosed("the helper closed the connection")
             self.buf += chunk
         line, self.buf = self.buf.split(b"\n", 1)
         msg = json.loads(line.decode())
@@ -149,11 +166,24 @@ def req(timeout=5.0, **kw):
     return r
 
 
-def vm_now():
-    c = Client()
-    vm = c.wait_state()["vm"]
-    c.close()
-    return vm
+def vm_now(patience=0.0):
+    """The VM part of the helper's state.  With `patience`, keeps trying
+    for that many seconds while the helper is away: it is back a second or
+    two after a restart, and neither Windows nor a session notices."""
+    deadline = time.monotonic() + patience
+    while True:
+        try:
+            c = Client()
+            vm = c.wait_state()["vm"]
+            c.close()
+            return vm
+        except HelperClosed:
+            if time.monotonic() >= deadline:
+                raise
+            _sleep(1)
+
+
+_sleep = time.sleep      # the tests swap this out
 
 
 # --------------------------------------------------------------------------
@@ -239,7 +269,7 @@ def cmd_change(args, cmd):
     while time.time() < deadline:
         try:
             m = c.read()
-        except socket.timeout:
+        except HelperTimeout:
             continue
         if m.get("type") != "state":
             continue
@@ -301,12 +331,15 @@ def launch_lock_path():
 
 def acquire_launch_lock():
     """Hold an exclusive lock for the life of this launch.  Returns the fd, or
-    None if another launch already holds it (one is mid-flight)."""
+    None if another launch already holds it (one is mid-flight).  When the
+    lock file itself cannot be made, says so and carries on without one (-1):
+    a full disk must not turn every launch into a silent no-op."""
     global _LAUNCH_LOCK_FD
     try:
         fd = os.open(launch_lock_path(), os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError:
-        return None
+    except OSError as e:
+        print("winplug: no launch lock (%s); carrying on without one" % e, file=sys.stderr)
+        return -1
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -380,10 +413,12 @@ def wait_rdp(timeout, every=1.0, tick=None):
 
 def session_ended_by(rc):
     """Who ended the RDP session, from xfreerdp3's exit code
-    (client/X11/xfreerdp.h): 0 success, 2 logoff and 11 disconnect-by-user
-    mean the person did; 128 and up mean no session was ever made; the rest
-    (1 disconnect, 3-10) mean Windows did: a reboot, another session, idle."""
-    if rc in (0, 2, 11):
+    (client/X11/xfreerdp.h, which mirrors the ERRINFO codes in
+    freerdp/error.h): 0 success, 2 logoff, 11 disconnect-by-user and 12
+    logoff-by-user mean the person did; 128 and up mean no session was ever
+    made; the rest (1 disconnect, 3-10) mean Windows did: a reboot, another
+    session, idle."""
+    if rc in (0, 2, 11, 12):
         return "user"
     if rc >= 128:
         return "nobody"
@@ -395,6 +430,80 @@ def session_ended_by(rc):
 # 9 privileges, 10 fresh credentials).  Reopening would only take the session
 # back from whoever has it now, or fail the same way again.
 FINAL_RDP_EXITS = (5, 7, 8, 9, 10)
+
+# Sessions that end this soon after opening, several in a row, are not a
+# reboot: Windows keeps throwing us out (a policy, a broken profile).  Stop
+# reopening after a few rather than spawn clients and bubbles for ever.
+SHORT_SESSION_SECONDS = 30
+MAX_SHORT_SESSIONS = 5
+
+
+def run_sessions(user, password, say):
+    """Open the RDP session, and open it again after Windows ends one (a
+    reboot from inside).  Returns why it is over:
+      "user"        the person closed it
+      "final"       another client took the session, or Windows refused us
+      "unreachable" no connection could be made at all
+      "bounced"     Windows kept ending sessions right after they opened
+      "gone"        Windows ended it and did not come back in time
+    Windows is left running in every case but the last two, where the
+    caller decides."""
+    failures = 0
+    short = 0
+    while True:
+        opened = time.monotonic()
+        rc = run_rdp(user, password)
+        lasted = time.monotonic() - opened
+        who = session_ended_by(rc)
+        if who == "user":
+            return "user"
+        if who == "nobody":
+            failures += 1
+            if failures > 4:
+                say("Could not connect to Windows",
+                    "xfreerdp3 exit code %d after %d tries; Windows is left running" % (rc, failures),
+                    "critical", notify=True)
+                return "unreachable"
+            say("Connection failed", "xfreerdp3 exit code %d; trying again" % rc)
+            _sleep(3)
+            if not wait_rdp(90):
+                say("Windows stopped answering", "it is left running", "critical", notify=True)
+                return "unreachable"
+            continue
+        if rc in FINAL_RDP_EXITS:
+            # Never reopen: that would take the session back from whoever
+            # has it now, or fail the same way again.  And never shut
+            # Windows down under them.
+            if rc == 5:
+                say("Windows went to another client",
+                    "someone else opened this Windows; it is left running", notify=True)
+            else:
+                say("Windows refused the connection",
+                    "xfreerdp3 exit code %d; Windows is left running, see http://127.0.0.1:8006" % rc,
+                    "critical", notify=True)
+            return "final"
+        short = short + 1 if lasted < SHORT_SESSION_SECONDS else 0
+        if short >= MAX_SHORT_SESSIONS:
+            say("Windows keeps ending the session",
+                "%d times in a row right after it opened (xfreerdp3 exit code %d); not trying again, "
+                "Windows is left running" % (short, rc), "critical", notify=True)
+            return "bounced"
+        # Windows ended the session itself: a reboot, a shutdown from inside.
+        # Wait for it and open it again.  One bubble per spell, not per try.
+        say("Windows closed the session", "waiting for it to come back; the session reopens by itself",
+            notify=None if short <= 1 else False)
+        if short:
+            _sleep(5)
+        deadline = time.monotonic() + RETURN_TIMEOUT
+        while time.monotonic() < deadline:
+            if rdp_answers():
+                break
+            if vm_now(patience=30)["status"] in ("off", "not-installed", "unknown"):
+                return "gone"
+            _sleep(2)
+        else:
+            return "gone"
+        failures = 0
 
 
 def read_credentials():
@@ -481,13 +590,27 @@ def cmd_launch(args):
     if vm["status"] == "stopping":
         say("Windows is shutting down", "waiting for that to finish first")
         for _ in range(120):
-            time.sleep(2)
-            vm = vm_now()
+            _sleep(2)
+            vm = vm_now(patience=30)
             if vm["status"] != "stopping":
                 break
     if vm["status"] not in ("running", "running-no-usb"):
         say("Starting Windows", "the session opens when Windows answers; a cold start takes a minute or two")
-        r = req(timeout=None, cmd="vm_up")
+        try:
+            r = req(timeout=None, cmd="vm_up")
+        except HelperClosed:
+            # The helper went away mid-start (an upgrade restarts it).  The
+            # start itself is a separate systemd unit and carries on; the new
+            # helper reports Windows as starting or running once it is.
+            say("The helper restarted while Windows was starting", "waiting for Windows anyway", notify=False)
+            deadline = time.monotonic() + 90
+            while True:
+                vm = vm_now(patience=60)
+                if vm["status"] in ("running", "running-no-usb", "starting") or time.monotonic() >= deadline:
+                    break
+                _sleep(2)
+            r = ({"ok": True} if vm["status"] in ("running", "running-no-usb", "starting")
+                 else {"ok": False, "error": "after the helper restarted: " + vm["message"]})
         if not r.get("ok"):
             say("Windows did not start", r.get("error", "unknown error"), "critical", notify=True)
             return 1
@@ -505,48 +628,15 @@ def cmd_launch(args):
         return 1
 
     user, password = read_credentials()
-    failures = 0
-    while True:
-        rc = run_rdp(user, password)
-        who = session_ended_by(rc)
-        if who == "user":
-            break
-        if who == "nobody":
-            failures += 1
-            if failures > 4:
-                say("Could not connect to Windows",
-                    "xfreerdp3 exit code %d after %d tries; Windows is left running" % (rc, failures),
-                    "critical", notify=True)
-                return 1
-            say("Connection failed", "xfreerdp3 exit code %d; trying again" % rc)
-            time.sleep(3)
-            if not wait_rdp(90):
-                say("Windows stopped answering", "it is left running", "critical", notify=True)
-                return 1
-            continue
-        if rc in FINAL_RDP_EXITS:
-            say("Windows ended the session",
-                "xfreerdp3 exit code %d: another client took it over, or Windows refused the connection; not reopening" % rc)
-            break
-        # Windows ended the session itself: a reboot, a shutdown from inside.
-        # Wait for it and open it again.
-        say("Windows closed the session", "waiting for it to come back; the session reopens by itself")
-        back = False
-        deadline = time.monotonic() + RETURN_TIMEOUT
-        while time.monotonic() < deadline:
-            if rdp_answers():
-                back = True
-                break
-            if vm_now()["status"] in ("off", "not-installed", "unknown"):
-                break
-            time.sleep(2)
-        if not back:
-            break
-        failures = 0
+    why = run_sessions(user, password, say)
+    if why in ("final", "unreachable", "bounced"):
+        # Someone may be using that Windows, or the person wants a look at it
+        # through the web viewer: it stays up either way.
+        return 0 if why == "final" else 1
 
     # The session is over.  Leave a running Windows alone unless it should
     # stop now; tidy up after one that shut itself down.
-    vm = vm_now()
+    vm = vm_now(patience=30)
     if vm["status"] not in ("running", "running-no-usb", "starting"):
         if vm.get("container_status") in ("exited", "created", "dead"):
             req(timeout=None, cmd="vm_down")
@@ -707,5 +797,7 @@ def main(argv):
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]) or 0)
+    except HelperClosed as e:
+        die(str(e))
     except KeyboardInterrupt:
         sys.exit(130)

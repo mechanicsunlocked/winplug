@@ -67,7 +67,18 @@ chmod 0644 "$conf"
 
 systemctl daemon-reload
 systemctl enable --now winplugd.service
-# A restart picks up a new daemon version when this is an upgrade.
+# A restart picks up a new daemon version when this is an upgrade.  Not in
+# the middle of a Windows start or shutdown, though: the job itself would
+# carry on (it is its own systemd unit) but the new daemon would not know,
+# and whoever asked would get no answer.
+job() {
+    [[ -x /usr/local/bin/winplug ]] || { echo ""; return; }
+    /usr/local/bin/winplug status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("job", ""))' 2>/dev/null || echo ""
+}
+if [[ -n $(job) ]]; then
+    echo "Windows is being $(job == up && echo started || echo stopped); waiting for that before restarting the helper..."
+    for _ in $(seq 1 150); do [[ -z $(job) ]] && break; sleep 2; done
+fi
 systemctl restart winplugd.service
 
 sleep 1

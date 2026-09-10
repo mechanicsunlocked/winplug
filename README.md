@@ -48,7 +48,17 @@ Check the whole chain with:
 winplug doctor
 ```
 
-Running the same three lines again is how you upgrade.
+To upgrade, pull the new version and run the two installers again:
+
+```bash
+omarchy plugin update io.github.mechanicsunlocked.winplug
+~/.config/omarchy/plugins/io.github.mechanicsunlocked.winplug/install.sh
+sudo ~/.config/omarchy/plugins/io.github.mechanicsunlocked.winplug/system/install.sh
+```
+
+The helper restarts in the last step; the bar reconnects by itself, and a
+running Windows and the devices in it are not touched. (If Windows is being
+started or shut down at that moment, the installer waits for that first.)
 
 ### Removing it
 
@@ -67,9 +77,9 @@ the "Windows" app entry back to Omarchy's launcher.
 ## How to use it
 
 Click the icon. At the top, Windows itself: a power switch (start it, or shut
-it down after a "Shut down Windows?" question), an *Open* button while it is
-running, and a *Start Windows at boot* toggle. Below, two lists: **In Windows**
-and **On this machine**.
+it down after a "Shut down Windows?" question), an *Open* button (opens the
+session, starting Windows first if it is off), and a *Start Windows at boot*
+toggle. Below, two lists: **In Windows** and **On this machine**.
 
 | Do this | Get this |
 |---|---|
@@ -85,7 +95,8 @@ and **On this machine**.
 
 The switch and the toggle go through the helper, so none of it asks for a
 password. Shutting down is Omarchy's own `docker compose down`: Windows gets
-an ACPI power-off and up to two minutes to finish.
+an ACPI power-off and up to two minutes to finish. The question opens on
+*Cancel*; Enter alone never shuts Windows down.
 
 The row tells you where things stand: *In Windows*, *Sending…*, *Goes to
 Windows when it starts*, *Not plugged in · still assigned*, or *Blocked ·
@@ -150,10 +161,11 @@ Docker's port proxy accepts the TCP connection long before Windows does).
 If Windows ends the session itself (a reboot for updates, say), the launcher
 waits for it to come back and reopens the session. It does not do that when
 another RDP client took the session over or Windows refused the connection;
-reopening would only take the session back. If the session was never made,
-Windows is left running and you are told why; it is never stopped behind your
-back. Started from the app entry or the bar, anything that goes wrong arrives
-as a notification.
+reopening would only take the session back. In those cases, when the session
+was never made, or when Windows keeps ending sessions the moment they open,
+Windows is left running and you are told why; it is never stopped behind
+your back or under somebody else. Started from the app entry or the bar,
+anything that goes wrong arrives as a notification.
 
 If you click the icon while Windows is still coming up from autostart, the
 launch simply joins that start and opens the session when Windows answers.
@@ -258,7 +270,7 @@ to turn this off.)
 ```bash
 python3 tools/test_winplugd.py    # compose patching, sysfs and monitor parsing (incl. a captured QEMU echo), launcher checks, RDP probe
 tools/test-daemon.sh              # the daemon against a fake QEMU monitor and a fake launcher, as a normal user
-tools/test-reconnect.sh           # the widget's link to the helper across a helper stop, crash and restart (needs a Wayland session)
+tools/test-reconnect.sh           # the widget's link to the helper across a helper stop, crash, restart, and the re-dial trick that once wedged the bar (needs a Wayland session)
 ```
 
 The fake monitor echoes like the real one: QEMU's monitor is a readline that

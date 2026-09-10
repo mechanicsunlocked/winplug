@@ -70,6 +70,9 @@ Panel {
   property int autostartPending: -1
   readonly property bool autostartShown: autostartPending >= 0 ? autostartPending === 1 : autostartOn
   property bool stopConfirmOpen: false
+  // The question opens on "Cancel", never on the destructive button: Enter
+  // on its own does not shut Windows down (the kit's default is the other way).
+  onStopConfirmOpenChanged: if (stopConfirmOpen) stopConfirm.selectedIndex = 0
   // The last refused request, shown under the hero for a moment.
   property string lastError: ""
 
@@ -457,7 +460,10 @@ Panel {
         if (root.stopConfirmOpen) root.stopConfirmOpen = false
         else root.close()
       }
-      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onTabRequested: function(direction) {
+        if (root.stopConfirmOpen) { stopConfirm.selectedIndex = stopConfirm.selectedIndex === 0 ? 1 : 0; return }
+        root.switchPanel(direction)
+      }
       onDeleteRequested: if (root.cursorActive && !root.stopConfirmOpen) root.deleteSelected()
       onTextKey: function(t) {
         if (root.stopConfirmOpen) return
@@ -498,7 +504,8 @@ Panel {
           // so those reach panel state through this item.
           readonly property bool connected: root.helperConnected
           readonly property bool lit: root.attachedCount > 0
-          readonly property bool showOpen: root.canLaunch && root.vmRunning
+          readonly property bool showOpen: root.canLaunch
+          readonly property string openHint: root.vmRunning ? "Open Windows (S)" : "Start Windows and open it (S)"
           readonly property bool showPower: root.canPower
           readonly property bool powerOn: root.powerOn
           readonly property bool busy: root.vmBusy
@@ -527,7 +534,8 @@ Panel {
                 opacity: heroHost.connected ? 1.0 : 0.5
               }
             }
-            // Open the session (when Windows is up), and the power switch.
+            // Open the session (starting Windows first if it is off), and
+            // the power switch.
             trailingControl: Component {
               Row {
                 spacing: Style.space(10)
@@ -536,7 +544,7 @@ Panel {
                   visible: heroHost.showOpen
                   anchors.verticalCenter: parent.verticalCenter
                   iconText: "\uf17a"
-                  tooltipText: "Open Windows (S)"
+                  tooltipText: heroHost.openHint
                   foreground: heroHost.fg
                   hoverColor: heroHost.fg
                   fontFamily: heroHost.font
@@ -581,7 +589,7 @@ Panel {
           width: parent.width
           label: "Start Windows at boot"
           description: root.autostartShown
-            ? "Comes up in the background after login and stays up when you close a session."
+            ? "Comes up in the background at boot and stays up when you close a session."
             : "Starts when you open it and shuts down when you close the session."
           checked: root.autostartShown
           foreground: root.foreground

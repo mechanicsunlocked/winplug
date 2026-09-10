@@ -51,6 +51,7 @@ cp "$here/socket-probe.qml" "$here/../HelperLink.qml" "$work/probe/"
 
 echo "1. probe up before the helper exists"
 PROBE_SOCKET="$sock" PROBE_RETRY_MS=300 quickshell -p "$work/probe/socket-probe.qml" >"$probe_log" 2>&1 &
+probe_pid=$!
 wait_for "loaded" 0 100 && pass "probe loaded HelperLink" || { flunk "probe did not load"; cat "$probe_log"; exit 1; }
 sleep 1.2
 (( $(count "connected=true") == 0 )) && pass "not connected while there is no socket" || flunk "connected to nothing?"
@@ -88,14 +89,34 @@ kill -TERM "$daemon_pid"; wait "$daemon_pid" 2>/dev/null
 start_daemon || { flunk "daemon did not restart"; exit 1; }
 wait_for "connected=true" "$t" && pass "reconnected again" || flunk "did not reconnect the second time"
 
+echo "6. the bar's own trick: 'connected = true' written to a live Socket, then a restart"
+# The panel used to do this (a binding re-asserting connected), which arms
+# Quickshell's re-dial-on-close and wedged the same Socket object on the
+# first refused dial.  v1 of the link passed 1-5 and failed this; v2 must
+# pass it: the link replaces the Socket instead of trusting it.
+kill "$probe_pid" 2>/dev/null; wait "$probe_pid" 2>/dev/null
+poke_log="$work/probe-poke.log"
+PROBE_SOCKET="$sock" PROBE_RETRY_MS=300 PROBE_POKE=1 quickshell -p "$work/probe/socket-probe.qml" >"$poke_log" 2>&1 &
+probe_pid=$!
+probe_log="$poke_log"
+wait_for "connected=true" 0 100 && pass "poke probe connected" || { flunk "poke probe did not connect"; cat "$poke_log"; }
+wait_for "poked" 0 50 && pass "wrote connected=true to the live socket" || flunk "no poke: $(tail -n3 "$poke_log")"
+t=$(count "connected=true"); l=$(count "line")
+kill -TERM "$daemon_pid"; wait "$daemon_pid" 2>/dev/null
+sleep 1.5  # the armed re-dial fails against nothing here
+start_daemon || { flunk "daemon did not restart"; exit 1; }
+wait_for "connected=true" "$t" 100 && pass "reconnected after the poke (fresh socket, not the wedged one)" || flunk "wedged by the poke: $(tail -n5 "$poke_log")"
+wait_for "line" "$l" && pass "and got a state push" || flunk "no state after the poke reconnect"
+probe_log="$work/probe.log"
+
 # QML-level trouble in the link itself.  Not ours: the portal warning (a
 # second Quickshell instance), and "not placed in the graphics scene" (the
 # probe has no window to put the link in; the bar does).
-grep -E 'WARN.*(qml|scene)|PROBE error' "$probe_log" | grep -vE 'qs-blackhole|graphics scene' | head -5 | sed 's/^/  NOTE  /'
+grep -hE 'WARN.*(qml|scene)|PROBE error' "$probe_log" "$poke_log" | grep -vE 'qs-blackhole|graphics scene' | head -5 | sed 's/^/  NOTE  /'
 # The socket errors above are expected -- one per refused dial -- and are
 # what a retry looks like; count them so a silent link shows up.
 dials=$(grep -c 'QLocalSocket::' "$probe_log")
 (( dials >= 6 )) && pass "$dials failed dials were retried with a fresh socket each" || flunk "only $dials dials seen"
 
 echo
-if (( fail )); then echo "FAILED -- probe log:"; cat "$probe_log"; exit 1; else echo "ALL PASSED"; fi
+if (( fail )); then echo "FAILED -- probe logs:"; cat "$probe_log" "$poke_log"; exit 1; else echo "ALL PASSED"; fi

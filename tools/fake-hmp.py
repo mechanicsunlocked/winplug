@@ -93,8 +93,19 @@ def readline_byte(ch):
     return out
 
 client = None
+def client_gone():
+    # The daemon hangs up after every command and dials again for the next
+    # one; its EOF and the new dial can land in the same select round.  Look
+    # for the EOF first, so the new connection is not refused for a client
+    # that has already left.
+    try:
+        return client.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+    except BlockingIOError:
+        return False
+    except OSError:
+        return True
 while True:
-    rl = [mon, ctl] + ([client] if client else [])
+    rl = ([client] if client else []) + [ctl, mon]
     r, _, _ = select.select(rl, [], [])
     for s in r:
         if s is ctl:
@@ -102,11 +113,13 @@ while True:
             c.sendall(control(data.strip()).encode()); c.close()
         elif s is mon:
             c, _ = mon.accept()
+            if client and client_gone():
+                client.close(); client = None
             if client:  # QEMU leaves extra clients waiting; we just queue one
                 c.close(); continue
             client = c; line = bytearray(); shown = 0
             client.sendall(b"QEMU 10.0.0 monitor - type 'help' for more information\r\n(qemu) ")
-        else:
+        elif s is client:
             data = client.recv(4096)
             if not data:
                 client.close(); client = None; continue

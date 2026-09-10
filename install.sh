@@ -44,14 +44,23 @@ else
 fi
 
 omarchy-shell shell rescanPlugins >/dev/null 2>&1 || warn "rescanPlugins failed; is the shell running?"
-if omarchy-plugin-list --json 2>/dev/null | jq -e --arg id "$PLUGIN_ID" \
-        'any(.[]; .id == $id and .enabled == true)' >/dev/null 2>&1; then
+plugin_state() {  # "enabled", "disabled", or "" when the shell has not seen it yet
+    omarchy-plugin-list --json 2>/dev/null | jq -r --arg id "$PLUGIN_ID" \
+        'first(.[] | select(.id == $id)) | if .enabled then "enabled" else "disabled" end' 2>/dev/null
+}
+# The scan is asynchronous: give the shell a moment to notice a fresh copy.
+for _ in $(seq 1 25); do [[ -n $(plugin_state) ]] && break; sleep 0.2; done
+if [[ $(plugin_state) == enabled ]]; then
     note "already enabled"
 else
     omarchy-plugin-enable "$PLUGIN_ID" --section right >/dev/null 2>&1 \
-        || omarchy-shell shell setPluginEnabled "$PLUGIN_ID" true >/dev/null 2>&1 \
-        || warn "could not enable the plugin; run: omarchy plugin enable $PLUGIN_ID --section right"
-    note "enabled, in the right section of the bar"
+        || omarchy-shell shell setPluginEnabled "$PLUGIN_ID" true >/dev/null 2>&1 || true
+    for _ in $(seq 1 25); do [[ $(plugin_state) == enabled ]] && break; sleep 0.2; done
+    if [[ $(plugin_state) == enabled ]]; then
+        note "enabled, in the right section of the bar"
+    else
+        warn "could not enable the plugin; run: omarchy plugin enable $PLUGIN_ID --section right"
+    fi
 fi
 
 # "Windows" in the app launcher is Omarchy's desktop entry, which runs
@@ -72,6 +81,7 @@ if [[ -f $entry ]]; then
             { print }' "$entry" >"$tmp" && mv -f "$tmp" "$entry"
         note "\"Windows\" in the app launcher now runs: winplug launch"
         note "(no password prompts; the session opens once Windows actually answers)"
+        [[ -x /usr/local/bin/winplug ]] || note "(it works once the sudo step below has installed winplug)"
     fi
     update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 else

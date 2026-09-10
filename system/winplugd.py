@@ -87,6 +87,10 @@ IDLE_AUDIT_SECONDS = float(os.environ.get("WINPLUG_AUDIT_SECONDS", "60"))
 # mount preparation and `docker compose up`; stop waits for the guest to power
 # down (Omarchy gives it two minutes).
 VM_JOB_TIMEOUT = {"up": 300, "down": 200}
+# Autostart means "at boot".  A daemon that comes up later than this after
+# the boot (an upgrade, a crash restart, a service enabled by hand) is not
+# booting, and does not start Windows on its own.
+AUTOSTART_BOOT_WINDOW = 15 * 60
 
 
 # --------------------------------------------------------------------------
@@ -159,6 +163,15 @@ def device_key(vid, pid):
     return "%s:%s" % (vid, pid)
 
 
+def boot_age():
+    """Seconds since boot, suspend included; 0 when unknown."""
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
 def qemu_id(key):
     return QEMU_ID_PREFIX + key.replace(":", "-")
 
@@ -194,9 +207,10 @@ def enumerate_usb(sysfs):
 
 
 def _usb_entry(sysfs, name):
-    """One device's sysfs attributes; None for a hub or an incomplete entry.
-    Raises OSError if the device disappears mid-read (this is a hot-plug
-    daemon: a directory listed a moment ago may be gone by now)."""
+    """One device's sysfs attributes; None for a hub, an incomplete entry,
+    or a device that is disappearing as we read it (this is a hot-plug
+    daemon: a directory listed a moment ago may be gone by now).  May also
+    raise OSError for the same reason; the caller skips the device."""
     d = os.path.join(sysfs, name)
     vid = _read(d + "/idVendor").lower()
     pid = _read(d + "/idProduct").lower()
@@ -209,16 +223,22 @@ def _usb_entry(sysfs, name):
     for entry in os.listdir(d) if os.path.isdir(d) else []:
         if re.fullmatch(re.escape(name) + r":\d+\.\d+", entry):
             drv = os.path.join(d, entry, "driver")
-            if os.path.islink(drv):
-                drivers.add(os.path.basename(os.readlink(drv)))
+            try:
+                if os.path.islink(drv):
+                    drivers.add(os.path.basename(os.readlink(drv)))
+            except OSError:
+                pass                    # the interface went away under us
     manufacturer = _read(d + "/manufacturer")
     product = _read(d + "/product")
     serial = _read(d + "/serial")
     try:
-        busnum = int(_read(d + "/busnum") or 0)
-        devnum = int(_read(d + "/devnum") or 0)
+        busnum = int(_read(d + "/busnum"))
+        devnum = int(_read(d + "/devnum"))
     except ValueError:
-        busnum = devnum = 0
+        # Every real device has both.  Missing means it is going away right
+        # now: not a device the VM could never see (bus 0), which would show
+        # for a tick as "restart Windows".
+        return None
     entry = {
         "key": device_key(vid, pid),
         "vid": vid,
@@ -578,26 +598,48 @@ class Store:
     def __init__(self, path):
         self.path = path
         self.assigned = {}     # key -> {"name": str, "added": float}
+        # Both mean "the list in memory is not the whole truth", and while
+        # either holds the daemon adopts what is in the guest instead of
+        # taking it out (Daemon.reconcile).
+        self.unusable = False  # the file was there but could not be read
+        self.unsaved = False   # the last save failed; retried from the tick
         self.load()
 
     def load(self):
+        self.unusable = False
         try:
             with open(self.path) as f:
                 data = json.load(f)
-        except (OSError, ValueError):
-            data = None
-        assigned = data.get("assigned") if isinstance(data, dict) else None
-        if not isinstance(assigned, dict):
-            # Unreadable, or not the shape we wrote: start empty rather than
-            # not at all.  The next assignment rewrites the file.
-            if os.path.exists(self.path):
-                log.warning("state file %s is unusable; starting with no assignments", self.path)
+        except FileNotFoundError:
             self.assigned = {}
             return
-        self.assigned = {k: v for k, v in assigned.items()
-                         if re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", k) and isinstance(v, dict)}
+        except (OSError, ValueError) as e:
+            data = e
+        assigned = data.get("assigned") if isinstance(data, dict) else None
+        if not isinstance(assigned, dict):
+            # Unreadable, or not the shape we wrote.  Start with no
+            # assignments rather than not at all -- and remember it: whatever
+            # is in Windows right now was put there on purpose (maybe
+            # mid-flash), so it is adopted, not removed.  The file stays as
+            # it is until a good list can be written over it.
+            log.warning("state file %s is unusable (%s); adopting what is in Windows", self.path,
+                        data if isinstance(data, Exception) else "not the expected shape")
+            self.assigned = {}
+            self.unusable = True
+            return
+        self.assigned = {}
+        for k, v in assigned.items():
+            if not (isinstance(k, str) and re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", k) and isinstance(v, dict)):
+                continue
+            name = v.get("name")
+            name = "".join(ch for ch in name if ch.isprintable()).strip()[:120] if isinstance(name, str) else ""
+            added = v.get("added")
+            self.assigned[k] = {"name": name or k,
+                                "added": float(added) if isinstance(added, (int, float)) else 0.0}
 
     def save(self):
+        """Write the list; False (and `unsaved`) when the disk would not
+        take it."""
         d = os.path.dirname(self.path)
         try:
             os.makedirs(d, exist_ok=True)
@@ -607,6 +649,11 @@ class Store:
             os.replace(tmp, self.path)
         except OSError as e:
             log.error("cannot save state to %s: %s", self.path, e)
+            self.unsaved = True
+            return False
+        self.unsaved = False
+        self.unusable = False
+        return True
 
 
 # --------------------------------------------------------------------------
@@ -640,6 +687,7 @@ class Daemon:
         self.audited_pid = 0         # container pid the leftover audit last ran for
         self.pending_removal = set() # device_del that failed; retried when the VM is back
         self.add_failed = {}         # key -> (when to try again, the error) after QEMU refused a device_add
+        self.save_retried = 0.0      # last attempt to write a state file the disk refused
         # VM start/stop: one job at a time, run by a worker thread, finished
         # on the main thread through the wake pipe.
         self.job = None
@@ -775,7 +823,10 @@ class Daemon:
             return
         c.setblocking(False)
         self.clients[c] = {"buf": b""}
-        self.send(c, self.state_message())
+        try:
+            self.send(c, self.state_message())
+        except Exception:      # the client asks again; the daemon lives on
+            log.exception("state snapshot failed")
 
     def read_client(self, c):
         try:
@@ -961,7 +1012,11 @@ class Daemon:
         t = threading.Thread(target=self.run_job, args=(job, argv), daemon=True)
         job["thread"] = t
         self.job = job
-        t.start()
+        try:
+            t.start()
+        except RuntimeError as e:      # no thread to be had: not a stuck "starting"
+            self.job = None
+            return "cannot run the job: %s" % e
         log.info("%s Windows: %s", "starting" if kind == "up" else "stopping", " ".join(argv[-3:]))
         self.broadcast_state(force=True)
         return ""
@@ -977,6 +1032,8 @@ class Daemon:
             job["result"] = (False, "timed out after %ds" % VM_JOB_TIMEOUT[job["kind"]], -1)
         except OSError as e:
             job["result"] = (False, str(e), -1)
+        except Exception as e:          # never leave the bar on "starting" for good
+            job["result"] = (False, "internal error: %s" % e, -1)
         try:
             os.write(self.wake_w, b"x")
         except OSError:
@@ -1019,18 +1076,25 @@ class Daemon:
         if os.path.exists(self.autostart_marker):
             log.info("autostart: already ran this boot")
             return
+        age = boot_age()
+        if age > AUTOSTART_BOOT_WINDOW:
+            log.info("autostart: the boot was %.0f min ago; this is a restart, not a boot", age / 60)
+            return
         if not self.launcher_ok:
             log.warning("autostart: no trusted launcher; not starting Windows")
             return
         self.autostart_at = time.monotonic() + self.cfg.autostart_delay
         log.info("autostart: Windows starts in %.0fs", self.cfg.autostart_delay)
 
-    def do_autostart(self):
+    def touch_autostart_marker(self):
         try:
             with open(self.autostart_marker, "w") as f:
                 f.write("%d\n" % time.time())
         except OSError as e:
             log.warning("autostart: cannot write %s: %s", self.autostart_marker, e)
+
+    def do_autostart(self):
+        self.touch_autostart_marker()
         self.vm._last_docker = 0.0
         self.vm.refresh(time.monotonic())
         if not self.vm.installed:
@@ -1082,6 +1146,9 @@ class Daemon:
                 pass
             return "cannot write %s: %s" % (path, e)
         self.cfg.autostart = on
+        if on:
+            # Switched on mid-boot: a daemon restart later today is not a boot.
+            self.touch_autostart_marker()
         log.info("autostart %s", "on" if on else "off")
         return ""
 
@@ -1098,6 +1165,10 @@ class Daemon:
         if self.autostart_at and now >= self.autostart_at:
             self.autostart_at = 0.0
             self.do_autostart()
+        if self.store.unsaved and now - self.save_retried > 10:
+            self.save_retried = now
+            self.store.save()
+        self.check_job(now)
         self.vm.refresh(now)
         if now - self.compose_checked > 10:
             self.compose_checked = now
@@ -1107,6 +1178,22 @@ class Daemon:
             self.fix_home_modes()
         self.reconcile()
         self.broadcast_state()
+
+    def check_job(self, now):
+        """A job whose worker vanished without a result would leave the bar
+        on "Windows is starting" for good: the tool has its own timeout, so
+        past that plus a margin the job is over, one way or the other."""
+        job = self.job
+        if not job or job["result"] is not None:
+            return
+        limit = VM_JOB_TIMEOUT[job["kind"]] + 60
+        if now - job["started"] < limit:
+            return
+        if job["thread"].is_alive() and now - job["started"] < limit + 120:
+            return
+        job["result"] = (False, "gave up waiting for the %s job" % job["kind"], -1)
+        log.error("Windows %s job hung; giving up", job["kind"])
+        self.finish_job()
 
     def check_compose(self, force=False):
         if not os.path.exists(self.cfg.compose):
@@ -1268,14 +1355,28 @@ class Daemon:
             self.note_add_failure(key, err, now)
 
         # Anything of ours in the guest that is no longer assigned goes away
-        # (an unassign that happened while the VM was unreachable).
-        for qid in attached:
-            if qid.startswith(QEMU_ID_PREFIX):
-                key = qid[len(QEMU_ID_PREFIX):].replace("-", ":", 1)
-                if key not in assigned:
-                    log.info("removing stale %s from the guest", qid)
-                    if self.qemu_remove(key):
-                        self.pending_removal.add(key)
+        # (an unassign that happened while the VM was unreachable) -- unless
+        # the list itself is not to be trusted: a state file that could not
+        # be read, or one the disk has refused since the last change.  Then
+        # what is in Windows stays there (it was put there on purpose, maybe
+        # mid-flash) and comes back onto the list instead.
+        ours = [qid[len(QEMU_ID_PREFIX):].replace("-", ":", 1)
+                for qid in attached if qid.startswith(QEMU_ID_PREFIX)]
+        if self.store.unusable:
+            for key in ours:
+                if key not in assigned and re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", key):
+                    assigned[key] = {"name": present.get(key, {}).get("name", key), "added": time.time()}
+                    self.status[key] = "attached"
+                    log.warning("adopting %s: it is in Windows and the state file was unusable", key)
+            self.store.save()
+            return
+        if self.store.unsaved:
+            return
+        for key in ours:
+            if key not in assigned:
+                log.info("removing stale %s from the guest", qemu_id(key))
+                if self.qemu_remove(key):
+                    self.pending_removal.add(key)
 
     def note_add_failure(self, key, err, now):
         """QEMU refused a device_add.  Say so once (not every two seconds)
@@ -1283,6 +1384,10 @@ class Daemon:
         open must not turn into a monitor command storm."""
         before = self.add_failed.get(key)
         self.add_failed[key] = (now + ADD_RETRY_SECONDS, err)
+        # The clock towards "no-access" runs from the last refusal, so a
+        # "Duplicate" after a spell of refusals still goes through the
+        # recreate step before the device is declared blocked.
+        self.unattached_since[key] = now
         if before is None or before[1] != err:
             log.warning("device_add %s failed: %s", key, err)
 
@@ -1341,12 +1446,12 @@ class Daemon:
             if d:
                 entry.update({k: d[k] for k in ("name", "manufacturer", "product", "serial", "speed", "bus", "port", "tags", "count", "drivers")})
             else:
-                entry.update({"name": self.store.assigned[key].get("name", key), "manufacturer": "", "product": "",
+                entry.update({"name": str(self.store.assigned[key].get("name") or key), "manufacturer": "", "product": "",
                               "serial": "", "speed": "", "bus": 0, "port": "", "tags": [], "count": 0, "drivers": []})
             if not assigned:
                 entry["status"] = "available"
             devices.append(entry)
-        devices.sort(key=lambda e: (not e["assigned"], not e["present"], e["name"].lower()))
+        devices.sort(key=lambda e: (not e["assigned"], not e["present"], str(e["name"]).lower()))
 
         if not vm.installed:
             vstatus, message = "not-installed", "Windows VM is not installed (omarchy windows vm install)"
