@@ -75,8 +75,9 @@ job() {
     [[ -x /usr/local/bin/winplug ]] || { echo ""; return; }
     /usr/local/bin/winplug status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("job", ""))' 2>/dev/null || echo ""
 }
-if [[ -n $(job) ]]; then
-    echo "Windows is being $(job == up && echo started || echo stopped); waiting for that before restarting the helper..."
+current=$(job)
+if [[ -n $current ]]; then
+    echo "Windows is being $([[ $current == up ]] && echo started || echo stopped); waiting for that before restarting the helper..."
     for _ in $(seq 1 150); do [[ -z $(job) ]] && break; sleep 2; done
 fi
 systemctl restart winplugd.service

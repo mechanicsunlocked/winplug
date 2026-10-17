@@ -149,7 +149,7 @@ mkdir -p "$work/run2"
     export WINPLUG_SOCKET="$work/run2/winplug.sock" WINPLUG_STATE="$work/state2.json" \
         WINPLUG_CONTAINER_PID=2147483647 WINPLUG_CONF="$work/winplug2.conf" WINPLUG_USER="$USER" \
         WINPLUG_VM_TOOL="$work/omarchy-windows-vm" WINPLUG_TRUST_VM_TOOL=1 WINPLUG_VM_RUNNER=direct \
-        WINPLUG_AUTOSTART=1 WINPLUG_AUTOSTART_DELAY=1
+        WINPLUG_AUTOSTART=1 WINPLUG_AUTOSTART_DELAY=1 WINPLUG_BOOT_AGE=30
     exec python3 "$here/../system/winplugd.py" 2>"$work/daemon2.log"
 ) &
 for i in $(seq 1 30); do [[ -S $work/run2/winplug.sock ]] && break; sleep 0.1; done

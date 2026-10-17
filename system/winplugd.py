@@ -165,6 +165,12 @@ def device_key(vid, pid):
 
 def boot_age():
     """Seconds since boot, suspend included; 0 when unknown."""
+    override = os.environ.get("WINPLUG_BOOT_AGE")     # tests: pretend the boot was this long ago
+    if override:
+        try:
+            return float(override)
+        except ValueError:
+            pass
     try:
         with open("/proc/uptime") as f:
             return float(f.read().split()[0])
