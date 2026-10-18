@@ -45,16 +45,24 @@ fi
 
 # The "Windows" app entry the user half wired to winplug would be dead
 # without the command: give it back to Omarchy's launcher here too, for the
-# user the helper served.
+# user the helper served.  The entry lives in that user's home, which this
+# script (root) must not touch: a file swapped for a symlink there would turn
+# root's temp-file-and-chown into a chown of any file on the system.  So the
+# restore runs as that user, with that user's rights and nothing more.
 user=$(sed -nE 's/^\s*user\s*=\s*//p' /etc/winplug/winplug.conf 2>/dev/null | head -1)
-home=$(getent passwd "${user:-}" 2>/dev/null | cut -d: -f6)
-entry="${home:-/nonexistent}/.local/share/applications/windows-vm.desktop"
-if [[ -f $entry ]] && grep -q '^X-Winplug-Original-Exec=' "$entry"; then
-    orig=$(sed -n 's/^X-Winplug-Original-Exec=//p' "$entry" | head -n1)
-    tmp=$(mktemp "$entry.XXXXXX")
-    awk -v orig="$orig" '/^X-Winplug/ { next } /^Exec=/ { print "Exec=" orig; next } { print }' "$entry" >"$tmp" \
-        && chown --reference="$entry" "$tmp" && chmod --reference="$entry" "$tmp" && mv -f "$tmp" "$entry" \
-        && echo "Windows app entry restored to: $orig"
+if [[ -n $user && $user != root ]] && id -u "$user" >/dev/null 2>&1; then
+    home=$(getent passwd "$user" | cut -d: -f6)
+    # cd /: the user's shell must not start in a directory only root can read.
+    (cd / && runuser -u "$user" -- bash -c '
+        entry="$1/.local/share/applications/windows-vm.desktop"
+        [[ -f $entry ]] && grep -q "^X-Winplug-Original-Exec=" "$entry" || exit 0
+        orig=$(sed -n "s/^X-Winplug-Original-Exec=//p" "$entry" | head -n1)
+        tmp=$(mktemp "$entry.XXXXXX") || exit 1
+        awk -v orig="$orig" "/^X-Winplug/ { next } /^Exec=/ { print \"Exec=\" orig; next } { print }" "$entry" >"$tmp" \
+            && chmod --reference="$entry" "$tmp" && mv -f "$tmp" "$entry" && echo "Windows app entry restored to: $orig" \
+            || { rm -f "$tmp"; exit 1; }
+        update-desktop-database "$1/.local/share/applications" 2>/dev/null || true
+    ' winplug-restore "$home") || echo "could not restore the Windows app entry for $user; run the user half: uninstall.sh" >&2
 fi
 
 systemctl disable --now winplugd.service 2>/dev/null || true

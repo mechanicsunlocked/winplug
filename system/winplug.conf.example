@@ -9,7 +9,8 @@ compose = /var/lib/omarchy/windows/docker-compose.yml
 # If the bus is not found the device is attached to the default bus instead.
 usb_bus = xhci.0
 # Clear the setgid bit dockur leaves on an empty ~/Windows, which otherwise
-# makes `omarchy windows vm launch` fail on the next start.
+# makes `omarchy windows vm launch` fail on the next start (Omarchy 4.0.4 and
+# older; 4.0.5 clears it itself, so there this does nothing).
 fix_home_modes = true
 # Start Windows at boot, in the background (`winplug autostart on|off`).
 autostart = false

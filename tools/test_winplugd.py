@@ -541,6 +541,103 @@ class Launcher(unittest.TestCase):
             dm.job = {"kind": "down"}
             self.assertEqual(dm.state_message()["vm"]["status"], "stopping")
 
+class HomeModes(unittest.TestCase):
+    """clear_setid_dirs runs as root on paths the user controls (~/Windows,
+    ~/.windows): it must change only a real directory owned by that user,
+    and never whatever a name points at, even if the name is swapped between
+    the check and the change."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = os.path.join(self.tmp.name, "home")
+        os.mkdir(self.home)
+        self.uid = os.getuid()
+
+    def mkdir(self, path, mode):
+        os.mkdir(path)
+        os.chmod(path, mode)
+        return path
+
+    def mode(self, path):
+        return stat.S_IMODE(os.lstat(path).st_mode)
+
+    def test_clears_setgid_on_a_real_directory(self):
+        d = self.mkdir(os.path.join(self.home, "Windows"), 0o2777)
+        self.assertEqual(w.clear_setid_dirs(self.home, self.uid, ("Windows", ".windows")), ["Windows"])
+        self.assertEqual(self.mode(d), 0o700)
+        self.assertEqual(w.clear_setid_dirs(self.home, self.uid, ("Windows",)), [])   # nothing left to do
+
+    def test_leaves_a_directory_without_the_bits_alone(self):
+        d = self.mkdir(os.path.join(self.home, "Windows"), 0o755)
+        self.assertEqual(w.clear_setid_dirs(self.home, self.uid, ("Windows",)), [])
+        self.assertEqual(self.mode(d), 0o755)
+
+    def test_never_follows_a_symlink(self):
+        victim = self.mkdir(os.path.join(self.tmp.name, "victim"), 0o2777)
+        os.symlink(victim, os.path.join(self.home, "Windows"))
+        self.assertEqual(w.clear_setid_dirs(self.home, self.uid, ("Windows",)), [])
+        self.assertEqual(self.mode(victim), 0o2777)
+
+    def test_never_follows_a_symlinked_home(self):
+        real = os.path.join(self.tmp.name, "realhome")
+        os.mkdir(real)
+        victim = self.mkdir(os.path.join(real, "Windows"), 0o2777)
+        link = os.path.join(self.tmp.name, "linkhome")
+        os.symlink(real, link)
+        self.assertEqual(w.clear_setid_dirs(link, self.uid, ("Windows",)), [])
+        self.assertEqual(self.mode(victim), 0o2777)
+
+    def test_skips_what_the_user_does_not_own(self):
+        d = self.mkdir(os.path.join(self.home, "Windows"), 0o2777)
+        self.assertEqual(w.clear_setid_dirs(self.home, self.uid + 1, ("Windows",)), [])   # home not theirs
+        self.assertEqual(self.mode(d), 0o2777)
+
+    def test_files_and_fifos_are_skipped_without_blocking(self):
+        f = os.path.join(self.home, "Windows")
+        with open(f, "w"):
+            pass
+        os.chmod(f, 0o2755)
+        os.mkfifo(os.path.join(self.home, ".windows"))     # an open() that blocked would hang the test
+        self.assertEqual(w.clear_setid_dirs(self.home, self.uid, ("Windows", ".windows")), [])
+        self.assertEqual(self.mode(f), 0o2755)
+
+    def test_a_swap_after_the_check_changes_only_the_checked_directory(self):
+        # The attack from the marketplace review: let the check pass on a real
+        # directory, then replace the name with a symlink before the change.
+        # Here the swap happens inside fstat, i.e. after the open and before
+        # fchmod -- the attacker winning the race every time.
+        name = os.path.join(self.home, "Windows")
+        checked = self.mkdir(name, 0o2777)
+        moved = os.path.join(self.home, "Windows.moved")
+        victim = self.mkdir(os.path.join(self.tmp.name, "victim"), 0o2777)
+        real_fstat = os.fstat
+        swapped = []
+        def fstat_then_swap(fd):
+            st = real_fstat(fd)
+            if not swapped and stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISGID:
+                os.rename(checked, moved)
+                os.symlink(victim, name)
+                swapped.append(True)
+            return st
+        w.os.fstat = fstat_then_swap
+        self.addCleanup(setattr, w.os, "fstat", real_fstat)
+        self.assertEqual(w.clear_setid_dirs(self.home, self.uid, ("Windows",)), ["Windows"])
+        self.assertTrue(swapped)
+        self.assertEqual(self.mode(victim), 0o2777)          # the symlink target is untouched
+        self.assertEqual(self.mode(moved), 0o700)            # the directory that was checked got the change
+        self.assertTrue(os.path.islink(name))
+
+    def test_daemon_only_acts_as_root(self):
+        cfg = w.Config("/nonexistent")
+        cfg.home, cfg.uid = self.home, self.uid
+        d = self.mkdir(os.path.join(self.home, "Windows"), 0o2777)
+        dm = w.Daemon.__new__(w.Daemon)
+        dm.cfg = cfg
+        dm.fix_home_modes()
+        self.assertEqual(self.mode(d), 0o2777 if os.geteuid() != 0 else 0o700)
+
+
 class Rdp(unittest.TestCase):
     def test_session_ended_by(self):
         for rc in (0, 2, 11, 12):

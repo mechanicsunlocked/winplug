@@ -258,12 +258,20 @@ list --json` shows the whole state message.
 
 ### A side effect you will like
 
-Omarchy's launcher requires `~/Windows` to be mode `0700` exactly, but dockur
-sets an empty shared folder to `2777`, and `chmod 0700` leaves the setgid bit
-in place. The result is that the *second* launch fails with no message.
-`winplugd` clears the bit whenever it sees it, so `omarchy windows vm launch`
-keeps working. (Reported upstream; set `fix_home_modes = false` in the config
-to turn this off.)
+Omarchy's launcher up to 4.0.4 requires `~/Windows` to be mode `0700`
+exactly, but dockur sets an empty shared folder to `2777`, and `chmod 0700`
+leaves the setgid bit in place. The result is that the *second* launch fails
+with no message. `winplugd` clears the bit whenever it sees it, so
+`omarchy windows vm launch` keeps working. Omarchy 4.0.5 clears the bit
+itself, so there this is a no-op; set `fix_home_modes = false` in the config
+to turn it off.
+
+The helper does this as root inside your home, so it never acts on a path
+name: it opens each folder once, refusing symlinks, checks that the open
+folder is a directory you own, and changes the mode through that open handle.
+Swapping the folder for a symlink can only make it skip the folder. That is
+also the rule for the root uninstaller, which restores the "Windows" app entry
+as you, not as root.
 
 ## Tests
 

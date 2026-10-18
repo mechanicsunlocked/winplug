@@ -520,6 +520,48 @@ def tool_trusted(path):
         probe = os.path.dirname(probe)
 
 
+def clear_setid_dirs(home, uid, names):
+    """Set each of `names` under `home` to 0700 when it carries a setuid or
+    setgid bit.  Returns the names it changed.
+
+    This runs as root on paths the user controls, so nothing here goes by a
+    path name twice.  Each directory is opened once, without following a
+    symlink at its last component (O_NOFOLLOW) and only if it is a directory
+    (O_DIRECTORY, which also keeps a FIFO from blocking the open); the checks
+    are made on that open file and the mode is changed through it (fchmod).
+    Swapping a name for a symlink, or for anything else, at any moment can
+    only make the open fail or leave the change on the very directory that
+    was checked: one owned by `uid`, which only ever loses bits.  The home
+    directory is pinned the same way, and the names are opened relative to
+    it."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    changed = []
+    try:
+        home_fd = os.open(home, flags)
+    except OSError:
+        return changed
+    try:
+        if os.fstat(home_fd).st_uid != uid:
+            return changed
+        for name in names:
+            try:
+                fd = os.open(name, flags, dir_fd=home_fd)
+            except OSError:
+                continue            # missing, a symlink (ELOOP), or not a directory
+            try:
+                st = os.fstat(fd)
+                if stat.S_ISDIR(st.st_mode) and st.st_uid == uid and st.st_mode & (stat.S_ISGID | stat.S_ISUID):
+                    os.fchmod(fd, 0o700)
+                    changed.append(name)
+            except OSError as e:
+                log.warning("could not clear setgid on %s: %s", os.path.join(home, name), e)
+            finally:
+                os.close(fd)
+    finally:
+        os.close(home_fd)
+    return changed
+
+
 # --------------------------------------------------------------------------
 # Compose file patch
 # --------------------------------------------------------------------------
@@ -1218,26 +1260,16 @@ class Daemon:
         return changed, err
 
     def fix_home_modes(self):
-        """Omarchy's launcher requires ~/Windows and ~/.windows to be mode
-        exactly 0700, but dockur sets the shared folder to 2777 whenever it is
-        empty, and GNU chmod 0700 keeps that setgid bit.  Result: the second
-        launch fails with no message.  Clear the bits so launch keeps working."""
+        """Omarchy's launcher up to 4.0.4 requires ~/Windows and ~/.windows to
+        be mode exactly 0700, but dockur sets the shared folder to 2777
+        whenever it is empty, and GNU chmod 0700 keeps that setgid bit.
+        Result: the second launch fails with no message.  Clear the bits so
+        launch keeps working.  (Omarchy 4.0.5 clears them itself.)"""
         if not self.cfg.home or self.cfg.uid is None or os.geteuid() != 0:
             return
-        for sub in ("Windows", ".windows"):
-            p = os.path.join(self.cfg.home, sub)
-            try:
-                st = os.lstat(p)
-            except OSError:
-                continue
-            if not stat.S_ISDIR(st.st_mode) or st.st_uid != self.cfg.uid:
-                continue
-            if st.st_mode & (stat.S_ISGID | stat.S_ISUID):
-                try:
-                    os.chmod(p, 0o700)
-                    log.info("cleared setgid on %s so 'omarchy windows vm launch' works again", p)
-                except OSError as e:
-                    log.warning("could not chmod %s: %s", p, e)
+        for name in clear_setid_dirs(self.cfg.home, self.cfg.uid, ("Windows", ".windows")):
+            log.info("cleared setgid on %s so 'omarchy windows vm launch' works again",
+                     os.path.join(self.cfg.home, name))
 
     # -- the core: make QEMU match the assignment list -----------------------
 
