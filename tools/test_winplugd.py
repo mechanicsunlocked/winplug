@@ -742,7 +742,39 @@ class SingleSession(unittest.TestCase):
         os.environ["XDG_RUNTIME_DIR"] = os.path.join(d, "nonexistent")
         self.assertEqual(cli.acquire_launch_lock(), -1)
 
+    def test_rdp_password_stays_off_the_command_line(self):
+        # /proc/<pid>/cmdline is world-readable; the password must travel
+        # over stdin, and /args-from must be the only argument (FreeRDP
+        # refuses it next to any other).
+        real_run = cli.subprocess.run
+        self.addCleanup(setattr, cli.subprocess, "run", real_run)
+        calls = []
+        def fake_run(argv, **kw):
+            if argv and argv[0] == "xfreerdp3":
+                calls.append((argv, kw))
+                return subprocess.CompletedProcess(argv, 0)
+            return real_run(argv, **kw)          # hyprctl, for the scale
+        cli.subprocess.run = fake_run
+        self.assertEqual(cli.run_rdp("docker", "s3cret"), 0)
+        argv, kw = calls[0]
+        self.assertEqual(argv, ["xfreerdp3", "/args-from:stdin"])
+        lines = kw["input"].split("\n")
+        for arg in ("/u:docker", "/p:s3cret", "/v:%s:%d" % (cli.RDP_HOST, cli.RDP_PORT),
+                    "/title:" + cli.RDP_TITLE, "/dynamic-resolution", "/gfx:AVC444"):
+            self.assertIn(arg, lines)
+        self.assertNotIn("s3cret", " ".join(argv))
+
+    def test_rdp_window_open_sees_the_launcher_window_by_title(self):
+        self.addCleanup(setattr, cli, "hypr_window_titles", cli.hypr_window_titles)
+        cli.RDP_HOST, cli.RDP_PORT = "127.0.0.1", 33899
+        cli.hypr_window_titles = lambda: ["foot", cli.RDP_TITLE]
+        self.assertTrue(cli.rdp_window_open())
+        cli.hypr_window_titles = lambda: ["foot"]
+        self.assertFalse(cli.rdp_window_open())
+
     def test_rdp_window_open_detects_a_client(self):
+        self.addCleanup(setattr, cli, "hypr_window_titles", cli.hypr_window_titles)
+        cli.hypr_window_titles = lambda: []
         cli.RDP_HOST, cli.RDP_PORT = "127.0.0.1", 33899
         self.assertFalse(cli.rdp_window_open())
         # A stand-in whose argv looks like an xfreerdp connected to this VM.

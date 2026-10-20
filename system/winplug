@@ -349,8 +349,25 @@ def acquire_launch_lock():
     return fd
 
 
+def hypr_window_titles():
+    """Titles of the windows Hyprland has open; [] where there is no Hyprland."""
+    if not shutil.which("hyprctl"):
+        return []
+    try:
+        out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=5).stdout
+        return [str(c.get("title", "")) for c in json.loads(out) if isinstance(c, dict)]
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+
+
 def rdp_window_open():
-    """True when some xfreerdp is already connected to this VM's RDP port."""
+    """True when a session onto this VM is already open: a window carrying
+    the launcher's title (ours, or Omarchy's own launcher, which uses the
+    same one), or an xfreerdp whose command line names this VM's port (an
+    older launcher; ours keeps the connection off the command line, see
+    run_rdp)."""
+    if RDP_TITLE in hypr_window_titles():
+        return True
     target = ("/v:%s:%d" % (RDP_HOST, RDP_PORT)).encode()
     me = os.getpid()
     try:
@@ -553,13 +570,18 @@ def rdp_scale():
 
 
 def run_rdp(user, password):
-    """Omarchy's own xfreerdp3 line, flag for flag."""
-    argv = ["xfreerdp3", "/u:" + user, "/p:" + password, "/v:%s:%d" % (RDP_HOST, RDP_PORT),
+    """Omarchy's own xfreerdp3 line, flag for flag.  The arguments go in over
+    stdin, as Omarchy's launcher does: /proc/<pid>/cmdline is readable by
+    every user on the machine, so a password on the command line is on show
+    for as long as the session is open.  /args-from has to be the only
+    argument; FreeRDP refuses it next to any other."""
+    args = ["/u:" + user, "/p:" + password, "/v:%s:%d" % (RDP_HOST, RDP_PORT),
             "-grab-keyboard", "/sound", "/microphone", "/clipboard", "/cert:ignore",
             "/title:" + RDP_TITLE, "/dynamic-resolution", "/gfx:AVC444",
             "/floatbar:sticky:off,default:visible,show:fullscreen"] + rdp_scale()
     try:
-        return subprocess.run(argv, env=rdp_env(), stdin=subprocess.DEVNULL).returncode
+        return subprocess.run(["xfreerdp3", "/args-from:stdin"], env=rdp_env(),
+                              input="\n".join(args) + "\n", text=True).returncode
     except FileNotFoundError:
         die("xfreerdp3 not found (sudo pacman -S freerdp)")
 
