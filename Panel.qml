@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Shapes
+import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
 import qs.Ui
@@ -293,10 +294,19 @@ Panel {
 
   // ---- the icon -----------------------------------------------------------------
   //
-  // The Windows four panes with a USB trident standing in front of them.  Drawn
-  // rather than borrowed: no glyph says "USB into Windows", and drawing it in
-  // the bar's own colour keeps it on theme.  Checked at the bar's real 16 px:
-  // the panes survive as four blocks, the trident as a stem with a fork.
+  // The mark from logo.svg in the bar's own colour: the four Windows panes with
+  // the USB trident in the bottom-right one.  Drawn rather than borrowed: no
+  // glyph says "USB into Windows", and drawing it keeps it on theme.
+  //
+  // Idle, all four panes are dim and the trident is full ink.  While a device is
+  // in Windows the USB pane lights up solid with the trident cut out of it, so
+  // whatever is behind the bar (the hover highlight too) shows through.
+  //
+  // A trident inside one pane needs room: under 24 device pixels (the bar's
+  // 16 px at scale 1) it turns into a blob.  There the icon falls back to the
+  // compact mark, the trident standing across all four panes and all four
+  // panes filling in when lit.  That one was checked at 16 px: the panes
+  // survive as four blocks, the trident as a stem with a fork.
   component WinplugIcon: Item {
     id: icon
     property color ink: root.foreground
@@ -304,91 +314,217 @@ Panel {
     property bool lit: false
 
     readonly property real s: Math.min(width, height)
+    readonly property bool compact: s * Screen.devicePixelRatio < 24
     readonly property real gap: Math.max(1, s * 0.09)
     readonly property real pane: (s - gap) / 2
+    readonly property real paneRadius: Math.max(0.5, s * 0.06)
     readonly property real stroke: Math.max(1, s * 0.11)
+    readonly property color dimColor: Qt.rgba(ink.r, ink.g, ink.b, paneAlpha)
     readonly property color paneColor: Qt.rgba(ink.r, ink.g, ink.b, lit ? Math.min(1, paneAlpha + 0.32) : paneAlpha)
 
-    // Four panes, slightly rounded like the modern Windows mark.
+    // Four panes, slightly rounded like the modern Windows mark.  In the full
+    // mark the fourth one is usbPane below.
     Repeater {
       model: 4
       Rectangle {
         required property int index
+        visible: icon.compact || index < 3
         x: (index % 2) * (icon.pane + icon.gap)
         y: Math.floor(index / 2) * (icon.pane + icon.gap)
         width: icon.pane
         height: icon.pane
-        radius: Math.max(0.5, icon.s * 0.06)
-        color: icon.paneColor
+        radius: icon.paneRadius
+        color: icon.compact ? icon.paneColor : icon.dimColor
       }
     }
 
-    // The trident: stem, fork to the left and right, and the three ends
-    // (circle, square, triangle) that every USB mark carries.
+    // ---- full mark: the trident in the bottom-right pane
+
+    Item {
+      id: usbPane
+      visible: !icon.compact
+      x: icon.pane + icon.gap
+      y: icon.pane + icon.gap
+      width: icon.pane
+      height: icon.pane
+
+      // Idle: a dim pane with the trident on it in full ink.
+      Rectangle {
+        anchors.fill: parent
+        visible: !icon.lit
+        radius: icon.paneRadius
+        color: icon.dimColor
+      }
+      Trident {
+        visible: !icon.lit
+        ink: icon.ink
+      }
+
+      // Lit: a solid pane, masked by the trident turned inside out.  The mask
+      // item fills the whole pane because a mask is stretched over the effect.
+      Rectangle {
+        id: solidPane
+        anchors.fill: parent
+        visible: false
+        radius: icon.paneRadius
+        color: icon.ink
+      }
+      Item {
+        id: cutout
+        anchors.fill: parent
+        visible: false
+        layer.enabled: true
+        layer.smooth: true
+        Trident { ink: "black" }    // only the alpha counts in a mask
+      }
+      MultiEffect {
+        anchors.fill: parent
+        visible: icon.lit
+        source: solidPane
+        maskEnabled: true
+        maskInverted: true
+        maskSource: cutout
+        maskThresholdMin: 0.5
+        maskSpreadAtMin: 1.0
+      }
+    }
+
+    // ---- compact mark: the trident across all four panes
+
+    Item {
+      anchors.fill: parent
+      visible: icon.compact
+
+      Shape {
+        anchors.fill: parent
+        preferredRendererType: Shape.CurveRenderer
+
+        // Stem, bottom-centre to top-centre.
+        ShapePath {
+          strokeColor: icon.ink
+          strokeWidth: icon.stroke
+          fillColor: "transparent"
+          capStyle: ShapePath.RoundCap
+          startX: icon.s * 0.5; startY: icon.s * 0.93
+          PathLine { x: icon.s * 0.5; y: icon.s * 0.22 }
+        }
+        // Left branch: leaves the stem, ends in a square.
+        ShapePath {
+          strokeColor: icon.ink
+          strokeWidth: icon.stroke
+          fillColor: "transparent"
+          capStyle: ShapePath.RoundCap
+          joinStyle: ShapePath.RoundJoin
+          startX: icon.s * 0.5; startY: icon.s * 0.66
+          PathLine { x: icon.s * 0.26; y: icon.s * 0.50 }
+          PathLine { x: icon.s * 0.26; y: icon.s * 0.40 }
+        }
+        // Right branch: ends in a circle.
+        ShapePath {
+          strokeColor: icon.ink
+          strokeWidth: icon.stroke
+          fillColor: "transparent"
+          capStyle: ShapePath.RoundCap
+          joinStyle: ShapePath.RoundJoin
+          startX: icon.s * 0.5; startY: icon.s * 0.56
+          PathLine { x: icon.s * 0.74; y: icon.s * 0.42 }
+          PathLine { x: icon.s * 0.74; y: icon.s * 0.36 }
+        }
+        // The arrow head at the top of the stem.
+        ShapePath {
+          strokeColor: "transparent"
+          fillColor: icon.ink
+          startX: icon.s * 0.5; startY: icon.s * 0.04
+          PathLine { x: icon.s * 0.64; y: icon.s * 0.24 }
+          PathLine { x: icon.s * 0.36; y: icon.s * 0.24 }
+          PathLine { x: icon.s * 0.5;  y: icon.s * 0.04 }
+        }
+      }
+      // Square end of the left branch.
+      Rectangle {
+        x: icon.s * 0.26 - width / 2; y: icon.s * 0.40 - height
+        width: icon.s * 0.16; height: width
+        color: icon.ink
+      }
+      // Circle end of the right branch.
+      Rectangle {
+        x: icon.s * 0.74 - width / 2; y: icon.s * 0.36 - height
+        width: icon.s * 0.17; height: width
+        radius: width / 2
+        color: icon.ink
+      }
+      // The plug end at the bottom of the stem.
+      Rectangle {
+        x: icon.s * 0.5 - width / 2; y: icon.s * 0.86
+        width: icon.s * 0.22; height: icon.s * 0.14
+        radius: Math.max(0.5, icon.s * 0.03)
+        color: icon.ink
+      }
+    }
+  }
+
+  // The USB trident as in logo.svg, in a 100-unit box that fills its pane
+  // with a small margin: arrow on top, round base, the left branch ending in
+  // a circle and the right one in a square.
+  component Trident: Item {
+    id: tri
+    property color ink: "white"
+    readonly property real u: width / 100
+
+    x: parent.width * 0.05
+    y: parent.height * 0.035
+    width: parent.width * 0.9
+    height: width
+
     Shape {
       anchors.fill: parent
       preferredRendererType: Shape.CurveRenderer
 
-      // Stem, bottom-centre to top-centre.
+      // Stem and both branches.
       ShapePath {
-        strokeColor: icon.ink
-        strokeWidth: icon.stroke
-        fillColor: "transparent"
-        capStyle: ShapePath.RoundCap
-        startX: icon.s * 0.5; startY: icon.s * 0.93
-        PathLine { x: icon.s * 0.5; y: icon.s * 0.22 }
-      }
-      // Left branch: leaves the stem, ends in a square.
-      ShapePath {
-        strokeColor: icon.ink
-        strokeWidth: icon.stroke
+        strokeColor: tri.ink
+        strokeWidth: 11 * tri.u
         fillColor: "transparent"
         capStyle: ShapePath.RoundCap
         joinStyle: ShapePath.RoundJoin
-        startX: icon.s * 0.5; startY: icon.s * 0.66
-        PathLine { x: icon.s * 0.26; y: icon.s * 0.50 }
-        PathLine { x: icon.s * 0.26; y: icon.s * 0.40 }
+        startX: 50 * tri.u; startY: 22 * tri.u
+        PathLine { x: 50 * tri.u; y: 80 * tri.u }
+        PathMove { x: 50 * tri.u; y: 66 * tri.u }
+        PathLine { x: 24 * tri.u; y: 50 * tri.u }
+        PathLine { x: 24 * tri.u; y: 40 * tri.u }
+        PathMove { x: 50 * tri.u; y: 54 * tri.u }
+        PathLine { x: 76 * tri.u; y: 38 * tri.u }
+        PathLine { x: 76 * tri.u; y: 30 * tri.u }
       }
-      // Right branch: ends in a circle.
-      ShapePath {
-        strokeColor: icon.ink
-        strokeWidth: icon.stroke
-        fillColor: "transparent"
-        capStyle: ShapePath.RoundCap
-        joinStyle: ShapePath.RoundJoin
-        startX: icon.s * 0.5; startY: icon.s * 0.56
-        PathLine { x: icon.s * 0.74; y: icon.s * 0.42 }
-        PathLine { x: icon.s * 0.74; y: icon.s * 0.36 }
-      }
-      // The arrow head at the top of the stem.
+      // Arrow head.
       ShapePath {
         strokeColor: "transparent"
-        fillColor: icon.ink
-        startX: icon.s * 0.5; startY: icon.s * 0.04
-        PathLine { x: icon.s * 0.64; y: icon.s * 0.24 }
-        PathLine { x: icon.s * 0.36; y: icon.s * 0.24 }
-        PathLine { x: icon.s * 0.5;  y: icon.s * 0.04 }
+        fillColor: tri.ink
+        startX: 50 * tri.u; startY: 3 * tri.u
+        PathLine { x: 63 * tri.u; y: 25 * tri.u }
+        PathLine { x: 37 * tri.u; y: 25 * tri.u }
+        PathLine { x: 50 * tri.u; y: 3 * tri.u }
       }
     }
-    // Square end of the left branch.
+    // Round base.
     Rectangle {
-      x: icon.s * 0.26 - width / 2; y: icon.s * 0.40 - height
-      width: icon.s * 0.16; height: width
-      color: icon.ink
-    }
-    // Circle end of the right branch.
-    Rectangle {
-      x: icon.s * 0.74 - width / 2; y: icon.s * 0.36 - height
-      width: icon.s * 0.17; height: width
+      x: 39 * tri.u; y: 75 * tri.u
+      width: 22 * tri.u; height: width
       radius: width / 2
-      color: icon.ink
+      color: tri.ink
     }
-    // The plug end at the bottom of the stem.
+    // Circle end of the left branch.
     Rectangle {
-      x: icon.s * 0.5 - width / 2; y: icon.s * 0.86
-      width: icon.s * 0.22; height: icon.s * 0.14
-      radius: Math.max(0.5, icon.s * 0.03)
-      color: icon.ink
+      x: 15 * tri.u; y: 24 * tri.u
+      width: 18 * tri.u; height: width
+      radius: width / 2
+      color: tri.ink
+    }
+    // Square end of the right branch.
+    Rectangle {
+      x: 68 * tri.u; y: 15 * tri.u
+      width: 16 * tri.u; height: width
+      color: tri.ink
     }
   }
 

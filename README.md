@@ -102,7 +102,9 @@ The row tells you where things stand: *In Windows*, *Sending…*, *Goes to
 Windows when it starts*, *Not plugged in · still assigned*, or *Blocked ·
 restart Windows once* (the VM was started with the old compose).
 
-The icon in the bar fills in while any device is in Windows; hover for the count.
+The icon in the bar lights up while any device is in Windows: its USB pane
+turns solid, or on a small bar (scale 1) the whole icon fills in. Hover for
+the count.
 
 From a terminal:
 
