@@ -240,7 +240,8 @@ through. Two honest notes:
 | USB 2.0 devices, hot replug | works | Left assigned, unplugged and plugged back in while Windows runs: it comes back in the VM by itself. |
 | Ross-Tech VCDS HEX-NET | works | Over USB. |
 | Shimano SM-PCE02 (E-TUBE PROJECT) | to test | |
-| Bosch DiagnosticTool 3 (eBike) | to test | Through USB-C and Mini-USB to USB-A adapters. |
+| Bosch eBike, USB-C on the main unit (DiagnosticTool 3) | to test | Newer bikes. |
+| Bosch eBike, Mini-USB to USB-A adapter (DiagnosticTool 3) | to test | Older bikes. |
 
 Tried one that is not here? Open an issue with the vendor:product id from
 `winplug list` and what happened.
