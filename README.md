@@ -233,6 +233,18 @@ through. Two honest notes:
   `~/Windows` shared folder is simpler. And dockur's warning stands: never have
   a USB drive attached while Windows Setup is still running.
 
+## Tested devices
+
+| Device | Status | Notes |
+|---|---|---|
+| USB 2.0 devices, hot replug | works | Left assigned, unplugged and plugged back in while Windows runs: it comes back in the VM by itself. |
+| Ross-Tech VCDS HEX-NET | works | Over USB. |
+| Shimano SM-PCE02 (E-TUBE PROJECT) | to test | |
+| Bosch DiagnosticTool 3 (eBike) | to test | Through USB-C and Mini-USB to USB-A adapters. |
+
+Tried one that is not here? Open an issue with the vendor:product id from
+`winplug list` and what happened.
+
 ## What it is not
 
 - Not for hubs. Hubs are hidden; plug the device in and send the device.
