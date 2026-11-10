@@ -139,6 +139,51 @@ class Hmp(unittest.TestCase):
         with self.assertRaises(w.HmpError):
             w.hmp(path, "info usb\nquit", timeout=1)           # never send a second line
 
+    def monitor(self, serve):
+        """A monitor socket whose one connection is handled by serve(conn)."""
+        d = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "monitor.sock")
+        srv = socket.socket(socket.AF_UNIX); srv.bind(path); srv.listen(1); self.addCleanup(srv.close)
+        def run():
+            c, _ = srv.accept()
+            try:
+                serve(c)
+            except OSError:
+                pass                                           # hmp() hung up on it, as it should
+            finally:
+                c.close()
+        t = threading.Thread(target=run, daemon=True); t.start()
+        self.addCleanup(t.join, 5)
+        return path
+
+    def test_hmp_gives_up_on_a_monitor_that_never_stops_sending(self):
+        # Every recv succeeds at once, so a per-read timeout never fires: only
+        # the byte cap ends this one.
+        def flood(c):
+            c.sendall(b"QEMU monitor\r\n(qemu) ")
+            while True:
+                c.sendall(b"x" * 65536)
+        self.addCleanup(setattr, w, "HMP_MAX_BYTES", w.HMP_MAX_BYTES)
+        w.HMP_MAX_BYTES = 256 * 1024
+        t0 = time.monotonic()
+        with self.assertRaises(w.HmpError) as e:
+            w.hmp(self.monitor(flood), "info usb", timeout=30)
+        self.assertIn("more than", str(e.exception))
+        self.assertLess(time.monotonic() - t0, 10)
+
+    def test_hmp_timeout_is_for_the_whole_exchange(self):
+        # A byte every 50 ms keeps each read alive for ever; the deadline is
+        # on the exchange.
+        def drip(c):
+            c.sendall(b"QEMU monitor\r\n(qemu) ")
+            while True:
+                c.sendall(b"."); time.sleep(0.05)
+        t0 = time.monotonic()
+        with self.assertRaises(w.HmpError) as e:
+            w.hmp(self.monitor(drip), "info usb", timeout=0.6)
+        self.assertRegex(str(e.exception), "in time|timed out")
+        self.assertLess(time.monotonic() - t0, 3)
+
     def test_parse_info_usb(self):
         txt = ("  Device 0.1, Port 1, Speed 480 Mb/s, Product QEMU USB Tablet, ID: usb-tablet\n"
                "  Device 0.2, Port 2, Speed 12 Mb/s, Product USB2.0-Serial, ID: winplug-1a86-7523\n")
@@ -399,6 +444,156 @@ class Launcher(unittest.TestCase):
             dm.read_client(c)
             self.assertEqual([(r["id"], r["ok"]) for r in self.replies(peer)], [(9, True)])
 
+    def test_request_ids_are_short_strings_or_integers(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d)
+            c, peer = self.client(dm)
+            for rid in (0, -3, 2 ** 53, "", "a" * w.MAX_ID_CHARS, None):
+                self.assertTrue(dm.valid_id(rid), rid)
+            for rid in (True, 1.5, 2 ** 53 + 1, "a" * (w.MAX_ID_CHARS + 1), [1], {"a": 1}):
+                self.assertFalse(dm.valid_id(rid), rid)
+                dm.handle(c, {"cmd": "ping", "id": rid})
+                m = self.replies(peer)[0]
+                self.assertFalse(m["ok"]); self.assertNotIn("id", m)
+                self.assertTrue(m["error"].startswith("bad request: id"), m["error"])
+            dm.handle(c, {"cmd": "ping", "id": "abc"})
+            self.assertEqual([(m["ok"], m["id"]) for m in self.replies(peer)], [(True, "abc")])
+
+    def test_waiters_for_a_job_are_deduplicated_and_bounded(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d)
+            t = threading.Thread(target=lambda: None); t.start(); t.join()
+            a, a_peer = self.client(dm)
+            dm.job = {"kind": "up", "waiters": [(a, 1)], "result": None, "started": time.monotonic(), "thread": t}
+            # The same question again is the same waiter.
+            for _ in range(50):
+                self.assertEqual(dm.start_job("up", a, 1), "")
+            self.assertEqual(dm.job["waiters"], [(a, 1)])
+            # One connection gets a few, then is told no.
+            for rid in range(2, w.MAX_JOB_WAITERS_PER_CLIENT + 1):
+                self.assertEqual(dm.start_job("up", a, rid), "")
+            self.assertIn("too many", dm.start_job("up", a, 999))
+            self.assertEqual(len(dm.job["waiters"]), w.MAX_JOB_WAITERS_PER_CLIENT)
+            # And so is everybody, once the list is full.
+            others = [self.client(dm)[0] for _ in range(w.MAX_JOB_WAITERS - len(dm.job["waiters"]))]
+            for o in others:
+                self.assertEqual(dm.start_job("up", o, None), "")
+            late, late_peer = self.client(dm)
+            self.assertIn("too many", dm.start_job("up", late, None))
+            self.assertEqual(len(dm.job["waiters"]), w.MAX_JOB_WAITERS)
+            # Through the front door the refusal is a reply, and the job goes on.
+            dm.vm.refresh = lambda now: None
+            dm.vm.installed = True; dm.vm.status = "absent"
+            dm.handle(late, {"cmd": "vm_up", "id": 5})
+            m = self.replies(late_peer)[0]
+            self.assertEqual((m["ok"], m["id"]), (False, 5)); self.assertIn("too many", m["error"])
+            self.assertIsNotNone(dm.job)
+            # Everyone who was let in is answered when it ends.
+            dm.job["result"] = (True, "", 0)
+            dm.tick = lambda: None
+            dm.finish_job()
+            self.assertEqual(sorted(m["id"] for m in self.replies(a_peer)), list(range(1, w.MAX_JOB_WAITERS_PER_CLIENT + 1)))
+
+    def test_a_flood_of_requests_in_one_read_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d)
+            c, peer = self.client(dm)
+            n = w.MAX_REQUESTS_PER_READ
+            peer.sendall(b'{"cmd":"ping"}\n' * (n + 50))
+            dm.read_client(c)
+            self.assertNotIn(c, dm.clients)
+            got = self.replies(peer)
+            self.assertEqual([m["ok"] for m in got], [True] * n + [False])
+            self.assertEqual(got[-1]["error"], "too many requests at once")
+            # Up to the limit is ordinary pipelining.
+            c, peer = self.client(dm)
+            peer.sendall(b'{"cmd":"ping"}\n' * n)
+            dm.read_client(c)
+            self.assertIn(c, dm.clients)
+            self.assertEqual(len(self.replies(peer)), n)
+
+    def test_buffered_input_is_bounded_per_client_and_in_all(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d)
+            c, peer = self.client(dm)
+            dm.clients[c]["buf"] = b"x" * w.CLIENT_MAX_BUFFER
+            peer.sendall(b"x")
+            dm.read_client(c)
+            self.assertNotIn(c, dm.clients)
+            self.assertEqual(self.replies(peer)[0]["error"], "request too long")
+            # Several clients each under their own cap, too much together:
+            # the one that pushes it over is the one that goes.
+            held = [self.client(dm) for _ in range(w.TOTAL_MAX_BUFFER // w.CLIENT_MAX_BUFFER)]
+            for hc, _ in held:
+                dm.clients[hc]["buf"] = b"x" * w.CLIENT_MAX_BUFFER
+            c, peer = self.client(dm)
+            peer.sendall(b"x")
+            dm.read_client(c)
+            self.assertNotIn(c, dm.clients)
+            self.assertEqual(self.replies(peer)[0]["error"], "too much input pending")
+            self.assertTrue(all(hc in dm.clients for hc, _ in held))
+
+    def test_connections_are_bounded(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d)
+            dm.state_message = lambda: {"type": "state"}
+            path = os.path.join(d, "l.sock")
+            lst = socket.socket(socket.AF_UNIX); lst.bind(path); lst.listen(8); lst.setblocking(False)
+            self.addCleanup(lst.close)
+            dm.listener = lst
+            peers = []
+            for _ in range(w.MAX_CLIENTS + 1):
+                p = socket.socket(socket.AF_UNIX); p.connect(path); p.settimeout(2); peers.append(p)
+                self.addCleanup(p.close)
+                dm.accept()
+            self.assertEqual(len(dm.clients), w.MAX_CLIENTS)
+            m = json.loads(peers[-1].recv(4096).decode())
+            self.assertEqual((m["ok"], m["error"]), (False, "too many connections"))
+            self.assertEqual(peers[-1].recv(4096), b"")          # and closed
+            for c in list(dm.clients): dm.drop(c)
+
+    def test_job_output_is_kept_by_its_tail_only(self):
+        # 3 MB on each stream: all of it is read (the tool is not blocked on a
+        # full pipe), a few KB are kept, and the last lines are still the last.
+        code = ("import sys\n"
+                "for i in range(60000):\n"
+                "    sys.stdout.write('out %06d %s\\n' % (i, 'x' * 40)); sys.stderr.write('err %06d %s\\n' % (i, 'y' * 40))\n"
+                "sys.exit(3)\n")
+        rc, out, err = w.run_bounded([sys.executable, "-c", code], 30)
+        self.assertEqual(rc, 3)
+        self.assertLessEqual(len(out), w.JOB_OUTPUT_KEEP); self.assertLessEqual(len(err), w.JOB_OUTPUT_KEEP)
+        self.assertTrue(out.rstrip().split("\n")[-1].startswith("out 059999"))
+        self.assertTrue(err.rstrip().split("\n")[-1].startswith("err 059999"))
+        # Quiet tools and failures to start are as before.
+        self.assertEqual(w.run_bounded(["/usr/bin/true"], 10), (0, "", ""))
+        with self.assertRaises(OSError):
+            w.run_bounded(["/nonexistent/tool"], 10)
+
+    def test_job_that_talks_for_ever_is_killed_at_the_timeout(self):
+        code = "import sys, time\nwhile True:\n    sys.stdout.write('x' * 4096); sys.stdout.flush()\n"
+        t0 = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            w.run_bounded([sys.executable, "-c", code], 0.5)
+        self.assertLess(time.monotonic() - t0, 5)
+
+    def test_failed_job_reports_the_last_lines_and_clears_the_job(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d)
+            cfg.container_pid_override = "2147483647"; cfg.compose = os.path.join(d, "none.yml")
+            tool = os.path.join(d, "tool")
+            with open(tool, "w") as f:
+                f.write("#!/bin/sh\nfor i in 1 2 3 4 5 6 7 8 9; do echo line $i; done\necho boom >&2\nexit 4\n")
+            os.chmod(tool, 0o755)
+            c, peer = self.client(dm)
+            job = {"kind": "up", "waiters": [(c, 1)], "result": None, "started": time.monotonic()}
+            dm.job = job
+            dm.run_job(job, [tool])
+            self.assertEqual(job["result"], (False, "line 5\nline 6\nline 7\nline 8\nline 9\nboom", 4))
+            dm.finish_job()
+            self.assertIsNone(dm.job)
+            m = self.replies(peer)[0]
+            self.assertEqual((m["ok"], m["id"]), (False, 1)); self.assertTrue(m["error"].endswith("boom"))
+
     def test_refused_add_is_retried_slowly_and_forgotten_on_detach(self):
         # After QEMU refuses a device, the daemon waits ADD_RETRY_SECONDS
         # before asking again -- but a take-back or a replug starts afresh.
@@ -645,8 +840,8 @@ class Launcher(unittest.TestCase):
             cfg.uid = os.getuid(); cfg.vm_runner = "direct"; cfg.vm_tool = "/usr/bin/true"
             cfg.container_pid_override = "2147483647"; cfg.compose = os.path.join(d, "none.yml")
             dm.launcher_ok = True
-            self.addCleanup(setattr, w.subprocess, "run", w.subprocess.run)
-            w.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no fork today"))
+            self.addCleanup(setattr, w, "run_bounded", w.run_bounded)
+            w.run_bounded = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no fork today"))
             c, peer = self.client(dm)
             self.assertEqual(dm.start_job("up", c, 1), "")
             dm.job["thread"].join(10)

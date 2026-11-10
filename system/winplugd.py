@@ -48,6 +48,7 @@ import os
 import pwd
 import re
 import select
+import selectors
 import signal
 import socket
 import stat
@@ -91,6 +92,31 @@ VM_JOB_TIMEOUT = {"up": 300, "down": 200}
 # the boot (an upgrade, a crash restart, a service enabled by hand) is not
 # booting, and does not start Windows on its own.
 AUTOSTART_BOOT_WINDOW = 15 * 60
+
+# Bounds on what the daemon will hold or do for anyone else.  None of them is
+# near what the bar and the CLI need; they exist so that neither a client on
+# the socket, nor a monitor or a tool that will not stop talking, can make a
+# root process grow or spin without end.
+#
+# One monitor exchange (connect, banner, command, reply): the whole of it is
+# held to hmp()'s timeout, and to this many bytes.  QEMU's readline echo of a
+# device_add is some 14 KB; `info usb` is a few lines.
+HMP_MAX_BYTES = 1 << 20
+# Clients: how many at once, how much unparsed input each and all of them
+# together may have buffered, and how many requests one read may carry.
+MAX_CLIENTS = 32
+CLIENT_MAX_BUFFER = 1 << 20
+TOTAL_MAX_BUFFER = 4 << 20
+MAX_REQUESTS_PER_READ = 16
+# A request id comes back in the reply, and is kept while a VM job runs.
+MAX_ID_CHARS = 64
+MAX_ID_INT = 1 << 53
+# Callers waiting for one running VM job, in all and per connection.
+MAX_JOB_WAITERS = 32
+MAX_JOB_WAITERS_PER_CLIENT = 4
+# Of a VM job's stdout and stderr, only this much of each tail is kept; the
+# reply quotes the last six lines.
+JOB_OUTPUT_KEEP = 8192
 
 
 # --------------------------------------------------------------------------
@@ -317,18 +343,25 @@ def hmp(path, command, timeout=5.0):
 
     One short-lived connection per command.  The container's own shutdown
     handler uses the same socket, and QEMU serves one client at a time, so a
-    connection that is held open would block the VM from powering down."""
+    connection that is held open would block the VM from powering down.
+
+    `timeout` covers the whole exchange, not each read: a monitor that keeps
+    sending is cut off at the deadline like one that sends nothing, and at
+    HMP_MAX_BYTES whichever comes first."""
     if "\n" in command or "\r" in command:
         raise HmpError("command must be a single line")
+    deadline = time.monotonic() + timeout
+    budget = [HMP_MAX_BYTES]
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(timeout)
     try:
+        s.settimeout(_time_left(deadline))
         s.connect(path)
-        _read_until(s, PROMPT)               # banner + first prompt
+        _read_until(s, PROMPT, deadline, budget)     # banner + first prompt
+        s.settimeout(_time_left(deadline))
         s.sendall(command.encode() + b"\n")
-        out = _read_until(s, PROMPT)
+        out = _read_until(s, PROMPT, deadline, budget)
     except (OSError, socket.timeout) as e:
-        raise HmpError(str(e))
+        raise HmpError(str(e) or "monitor did not answer in time")
     finally:
         try:
             s.close()
@@ -358,14 +391,63 @@ def hmp_output(raw, command):
     return "\n".join(l for l in lines if l.strip() != "").strip()
 
 
-def _read_until(s, marker):
+def _time_left(deadline):
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise HmpError("monitor did not answer in time")
+    return left
+
+
+def _read_until(s, marker, deadline, budget):
+    """Read up to `marker`.  `budget` is a one-element list, the bytes the
+    whole exchange may still take; it is shared by the reads of one hmp()."""
     buf = b""
     while not buf.endswith(marker):
+        s.settimeout(_time_left(deadline))
         chunk = s.recv(4096)
         if not chunk:
             raise HmpError("monitor closed the connection")
+        budget[0] -= len(chunk)
+        if budget[0] < 0:
+            raise HmpError("monitor sent more than %d bytes" % HMP_MAX_BYTES)
         buf += chunk
     return buf
+
+
+def run_bounded(argv, timeout, keep=JOB_OUTPUT_KEEP):
+    """Run argv to its end and return (returncode, stdout tail, stderr tail).
+
+    Like subprocess.run(capture_output=True), except that the output is read
+    as it comes and only the last `keep` bytes of each stream are held, so a
+    tool that prints without end costs time (until `timeout`, then it is
+    killed and subprocess.TimeoutExpired raised) but not memory."""
+    deadline = time.monotonic() + timeout
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    tails = {p.stdout: b"", p.stderr: b""}
+    sel = selectors.DefaultSelector()
+    try:
+        for f in tails:
+            sel.register(f, selectors.EVENT_READ)
+        while sel.get_map():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            for key, _ in sel.select(left):
+                chunk = os.read(key.fd, 65536)
+                if chunk:
+                    tails[key.fileobj] = (tails[key.fileobj] + chunk)[-keep:]
+                else:
+                    sel.unregister(key.fileobj)
+        p.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except BaseException:
+        p.kill()
+        p.wait()
+        raise
+    finally:
+        sel.close()
+        p.stdout.close()
+        p.stderr.close()
+    return (p.returncode, tails[p.stdout].decode(errors="replace"), tails[p.stderr].decode(errors="replace"))
 
 
 def parse_info_usb(text):
@@ -885,6 +967,14 @@ class Daemon:
         except OSError:
             return
         c.setblocking(False)
+        if len(self.clients) >= MAX_CLIENTS:
+            # Say so rather than leave it hanging: the caller retries later.
+            try:
+                c.sendall(b'{"type":"reply","ok":false,"error":"too many connections"}\n')
+            except OSError:
+                pass
+            c.close()
+            return
         self.clients[c] = {"buf": b""}
         try:
             self.send(c, self.state_message())
@@ -903,14 +993,23 @@ class Daemon:
             return
         st = self.clients[c]
         st["buf"] += data
-        if len(st["buf"]) > 1 << 20:
-            self.drop(c)
-            return
+        if len(st["buf"]) > CLIENT_MAX_BUFFER:
+            return self.reject(c, "request too long")
+        if sum(len(o["buf"]) for o in self.clients.values()) > TOTAL_MAX_BUFFER:
+            # All clients together hold too much unfinished input; the one
+            # that just added to it goes.
+            return self.reject(c, "too much input pending")
+        handled = 0
         while b"\n" in st["buf"]:
             line, st["buf"] = st["buf"].split(b"\n", 1)
             line = line.strip()
             if not line:
                 continue
+            if handled >= MAX_REQUESTS_PER_READ:
+                # One turn of the main loop serves a bounded number of
+                # requests; a flood is refused, not queued.
+                return self.reject(c, "too many requests at once")
+            handled += 1
             try:
                 req = json.loads(line.decode())
                 if not isinstance(req, dict):
@@ -922,6 +1021,23 @@ class Daemon:
                 self.send(c, {"type": "reply", "ok": False, "error": "bad request: %s" % e})
                 continue
             self.handle(c, req)
+            if c not in self.clients:      # dropped while being answered
+                return
+
+    def reject(self, c, error):
+        """Refuse a client outright: one last reply saying why, then close."""
+        self.send(c, {"type": "reply", "ok": False, "error": error})
+        self.drop(c)
+
+    @staticmethod
+    def valid_id(rid):
+        """A request id is echoed in the reply and kept while a VM job runs,
+        so it is a short string or a plain integer, or absent."""
+        if rid is None:
+            return True
+        if isinstance(rid, str):
+            return len(rid) <= MAX_ID_CHARS
+        return isinstance(rid, int) and not isinstance(rid, bool) and abs(rid) <= MAX_ID_INT
 
     def drop(self, c):
         self.clients.pop(c, None)
@@ -948,6 +1064,10 @@ class Daemon:
     def handle(self, c, req):
         # A request must never take the daemon (and with it every assigned
         # device's bookkeeping) down: whatever goes wrong becomes a reply.
+        if not self.valid_id(req.get("id")):
+            self.send(c, {"type": "reply", "ok": False,
+                          "error": "bad request: id must be an integer or a string of at most %d characters" % MAX_ID_CHARS})
+            return
         try:
             self._handle(c, req)
         except Exception as e:
@@ -1066,7 +1186,16 @@ class Daemon:
             if self.job["kind"] == kind:
                 # The same thing is already under way (autostart, or a second
                 # click): this caller gets its answer when that one finishes.
-                self.job["waiters"].append((c, rid))
+                # Asking twice with the same id on the same connection is
+                # one question; beyond that the list is bounded.
+                waiters = self.job["waiters"]
+                if (c, rid) in waiters:
+                    return ""
+                if (len(waiters) >= MAX_JOB_WAITERS
+                        or sum(1 for wc, _ in waiters if wc is c) >= MAX_JOB_WAITERS_PER_CLIENT):
+                    return "too many requests are already waiting for Windows to %s" % (
+                        "start" if kind == "up" else "stop")
+                waiters.append((c, rid))
                 return ""
             return "Windows is already being %s" % ("started" if self.job["kind"] == "up" else "stopped")
         if not self.launcher_ok:
@@ -1090,10 +1219,9 @@ class Daemon:
     def run_job(self, job, argv):
         """Worker thread: run the tool, park the result, wake the main loop."""
         try:
-            p = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                               timeout=VM_JOB_TIMEOUT[job["kind"]] + 30)
-            lines = [l for l in (p.stdout + "\n" + p.stderr).split("\n") if l.strip()]
-            job["result"] = (p.returncode == 0, "" if p.returncode == 0 else "\n".join(lines[-6:]), p.returncode)
+            rc, out, err = run_bounded(argv, VM_JOB_TIMEOUT[job["kind"]] + 30)
+            lines = [l for l in (out + "\n" + err).split("\n") if l.strip()]
+            job["result"] = (rc == 0, "" if rc == 0 else "\n".join(lines[-6:]), rc)
         except subprocess.TimeoutExpired:
             job["result"] = (False, "timed out after %ds" % VM_JOB_TIMEOUT[job["kind"]], -1)
         except OSError as e:
