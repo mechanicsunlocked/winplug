@@ -11,10 +11,10 @@ Runs as root (systemd), owns three jobs:
      needs the docker group.
 
   2. Watch udev.  A dongle that is unplugged and plugged back in gets a new
-     device node; QEMU re-opens it by vendor:product on its own, and this
-     daemon checks that it actually did, and recreates the device if not.
-     This is the "replugged device never came back" bug the earlier version
-     had.
+     device node, and QEMU never opens that one by itself: the daemon hands
+     QEMU the node (usb-host,hostdevice=...) and swaps it for the new one
+     after a replug.  See qemu_add for why vendor:product matching cannot do
+     this inside the container.
 
   3. Make the container *able* to see hot-plugged devices at all: Omarchy's
      compose only lists /dev/kvm and /dev/net/tun.  Docker's `devices:`
@@ -62,11 +62,11 @@ CONF_PATH = os.environ.get("WINPLUG_CONF", "/etc/winplug/winplug.conf")
 PROTOCOL_VERSION = 1
 QEMU_ID_PREFIX = "winplug-"
 USB_MAJOR = 189
+USB_DEV_DIR = "/dev/bus/usb"
 TICK_SECONDS = 2.0
 DOCKER_POLL_SECONDS = 3.0
-# How long a plugged-in, assigned device may sit unattached before the
-# usb-host device is torn down and recreated.  QEMU's own re-scan runs every
-# two seconds, so anything past this is a device it will not pick up again.
+# How long a plugged-in, assigned device may sit unattached, with its id
+# still taken in QEMU, before the usb-host device is torn down and recreated.
 REATTACH_AFTER_SECONDS = 7.0
 # A device that is still not attached this long after the container clearly
 # has the device nodes points at the cgroup rule, i.e. the VM was started with
@@ -207,6 +207,7 @@ def enumerate_usb(sysfs):
         key = entry["key"]
         if key in devices:
             devices[key]["count"] += 1
+            devices[key]["nodes"].append(entry["node"])
         else:
             devices[key] = entry
     return devices
@@ -255,12 +256,14 @@ def _usb_entry(sysfs, name):
         "speed": _read(d + "/speed"),
         "bus": busnum,
         "dev": devnum,
+        "node": "%s/%03d/%03d" % (USB_DEV_DIR, busnum, devnum),
         "port": name.split("-", 1)[1],
         "sysname": name,
         "class": dev_class,
         "drivers": sorted(drivers),
         "count": 1,
     }
+    entry["nodes"] = [entry["node"]]
     entry["name"] = display_name(entry)
     entry["tags"] = tags_for(entry)
     return entry
@@ -366,8 +369,18 @@ def _read_until(s, marker):
 
 
 def parse_info_usb(text):
-    """IDs of the devices currently attached to the guest."""
+    """IDs of the USB devices QEMU has.  Being listed does not mean the guest
+    has the device: a usb-host device whose host device is gone, or was never
+    opened, keeps its port and stays on the list as an empty shell."""
     return set(re.findall(r"ID:\s*(\S+)", text))
+
+
+def parse_qdev_node(text):
+    """The reply to `qom-get <usb-host device> hostdevice`: the node the
+    device was added with, "" for one added by vendor:product, None when the
+    reply is not an answer to that question."""
+    m = re.fullmatch(r'"(%s/\d{3}/\d{3})?"' % re.escape(USB_DEV_DIR), text.strip())
+    return (m.group(1) or "") if m else None
 
 
 def classify_docker_failure(stderr):
@@ -722,6 +735,8 @@ class Daemon:
         self.detail = {}             # key -> human detail
         self.unattached_since = {}   # key -> time first seen present-but-unattached
         self.recreate = set()        # keys whose qdev was deleted and must be re-added
+        self.qdev_node = {}          # key -> node its qdev was added with; "" = added by vendor:product
+        self.by_node = True          # this QEMU takes usb-host,hostdevice=<node>
         self.compose_patched = False
         self.compose_error = ""
         self.compose_checked = 0.0
@@ -900,7 +915,10 @@ class Daemon:
                 req = json.loads(line.decode())
                 if not isinstance(req, dict):
                     raise ValueError("not an object")
-            except ValueError as e:
+            except (ValueError, RecursionError) as e:
+                # RecursionError: a request nested deeper than the parser's
+                # stack.  It fits under the 1 MiB cap and is not a ValueError,
+                # so without this a client could take the daemon down with it.
                 self.send(c, {"type": "reply", "ok": False, "error": "bad request: %s" % e})
                 continue
             self.handle(c, req)
@@ -1286,7 +1304,13 @@ class Daemon:
             self.unattached_since.clear()
             self.recreate.clear()
             self.add_failed.clear()
+            self.qdev_node.clear()
+            self.by_node = True
             return
+        if vm.pid != self.audited_pid:
+            # Another QEMU: nothing known about the last one's devices holds.
+            self.qdev_node.clear()
+            self.by_node = True
 
         # Removals that failed while the VM was unreachable.
         for key in list(self.pending_removal):
@@ -1300,7 +1324,10 @@ class Daemon:
         active = [k for k in assigned if k in present]
         settled = bool(active) and not self.recreate and all(self.status.get(k) == "attached" for k in active)
         since_poll = now - self.last_poll
-        if vm.pid != self.audited_pid or self.udev_kick or self.recreate:
+        # A device that sits at another node than the one QEMU was given has
+        # been replugged; that shows in sysfs alone, udev event or not.
+        moved = any(self.qdev_node.get(k) and self.qdev_node[k] not in present[k]["nodes"] for k in active)
+        if vm.pid != self.audited_pid or self.udev_kick or self.recreate or moved:
             poll = True
         elif active and not settled:
             poll = True
@@ -1315,7 +1342,7 @@ class Daemon:
             return
 
         try:
-            attached = parse_info_usb(hmp(vm.monitor, "info usb"))
+            qdevs = parse_info_usb(hmp(vm.monitor, "info usb"))
             self.last_hmp_error = ""
         except HmpError as e:
             self.last_hmp_error = str(e)
@@ -1336,7 +1363,19 @@ class Daemon:
                 self.unattached_since.pop(key, None)
                 self.add_failed.pop(key, None)
                 continue
-            if qid in attached:
+            if qid in qdevs and self.qdev_is_stale(key, dev):
+                # QEMU still has the device it was given before the replug:
+                # an empty shell.  It never opens the new one by itself (see
+                # qemu_add), so replace the shell with the device that is
+                # plugged in now.
+                log.info("%s is back at %s; handing it to Windows again", key, dev["node"])
+                err = self.qemu_remove(key)
+                if err:
+                    self.status[key] = "attaching"
+                    self.detail[key] = err
+                    continue
+                self.recreate.add(key)
+            elif qid in qdevs:
                 self.status[key] = "attached"
                 self.detail[key] = ""
                 self.unattached_since.pop(key, None)
@@ -1362,10 +1401,11 @@ class Daemon:
                 # runs from when the device first sat unattached, not from
                 # the recreate.
                 self.recreate.discard(key)
-                self.status[key] = "attaching" if not err else "error"
-                self.detail[key] = err
                 if err:
-                    self.note_add_failure(key, err, now)
+                    self.add_refused(key, err, now)
+                else:
+                    self.status[key] = "attaching"
+                    self.detail[key] = ""
                 continue
             err = self.qemu_add(key, dev)
             if not err:
@@ -1388,9 +1428,7 @@ class Daemon:
                 else:
                     self.status[key] = "attaching"
                 continue
-            self.status[key] = "error"
-            self.detail[key] = err
-            self.note_add_failure(key, err, now)
+            self.add_refused(key, err, now)
 
         # Anything of ours in the guest that is no longer assigned goes away
         # (an unassign that happened while the VM was unreachable) -- unless
@@ -1399,7 +1437,7 @@ class Daemon:
         # what is in Windows stays there (it was put there on purpose, maybe
         # mid-flash) and comes back onto the list instead.
         ours = [qid[len(QEMU_ID_PREFIX):].replace("-", ":", 1)
-                for qid in attached if qid.startswith(QEMU_ID_PREFIX)]
+                for qid in qdevs if qid.startswith(QEMU_ID_PREFIX)]
         if self.store.unusable:
             for key in ours:
                 if key not in assigned and re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", key):
@@ -1429,24 +1467,80 @@ class Daemon:
         if before is None or before[1] != err:
             log.warning("device_add %s failed: %s", key, err)
 
-    def qemu_add(self, key, dev):
-        """device_add; returns an error string, empty on success."""
-        base = "device_add usb-host,vendorid=0x%s,productid=0x%s,id=%s" % (dev["vid"], dev["pid"], qemu_id(key))
-        cmds = [base + ",bus=" + self.cfg.usb_bus, base] if self.cfg.usb_bus else [base]
-        err = ""
-        for cmd in cmds:
+    def add_refused(self, key, err, now):
+        """QEMU answered a device_add with an error."""
+        if "not permitted" in err or "ermission denied" in err:
+            # The node is there and QEMU may not open it: the device-cgroup
+            # rule is missing, i.e. the VM was started with the old compose.
+            self.status[key] = "no-access"
+            self.detail[key] = "QEMU cannot open the device; restart Windows so the USB rule applies"
+        else:
+            self.status[key] = "error"
+            self.detail[key] = err
+        self.note_add_failure(key, err, now)
+
+    def qdev_is_stale(self, key, dev):
+        """Whether QEMU's device for `key` is known not to be the device that
+        is plugged in now.  Only ever True on evidence: taking a device out of
+        Windows on a guess could take it out in the middle of a flash."""
+        node = self.qdev_node.get(key)
+        if node is None:
+            # Not added by this process (the helper was restarted or
+            # upgraded while the device was in Windows): ask QEMU.
             try:
-                out = hmp(self.vm.monitor, cmd)
-            except HmpError as e:
-                return "monitor: %s" % e
-            if not out:
-                return ""
-            err = out
-            if "Duplicate" in out:
-                return out
-            if "Bus" in out and "not found" in out:
-                continue        # retry without an explicit bus
-            return out
+                node = parse_qdev_node(hmp(self.vm.monitor, "qom-get /machine/peripheral/%s hostdevice" % qemu_id(key)))
+            except HmpError:
+                return False
+            if node is None:
+                node = ""           # a QEMU that cannot say: treat as added by vendor:product
+            self.qdev_node[key] = node
+        if node:
+            # A replugged device always comes back at another address.
+            return node not in dev["nodes"]
+        # Added by vendor:product (an older helper, or a QEMU without
+        # hostdevice).  QEMU takes a device's kernel drivers off when it opens
+        # it, so a Linux driver on the device means Windows does not have it.
+        # No driver at all proves nothing: plenty of devices have none.
+        return self.by_node and bool(set(dev["drivers"]) - {"usbfs"})
+
+    def qemu_add(self, key, dev):
+        """device_add; returns an error string, empty on success.
+
+        By device node, not by vendor:product.  QEMU finds a vendor:product
+        match in libusb's device list, and inside the container that list is
+        only ever filled once, when QEMU first touches USB: libusb learns of
+        later devices from udev, and no udev event reaches the container (no
+        /run/udev there, and its own network namespace).  So a device plugged
+        in afterwards -- every replug -- is invisible to that match for as
+        long as the VM runs.  Opening the node needs none of that.  The price
+        is that the device is tied to this one node: after a replug the
+        reconcile loop swaps it for the new one."""
+        qid = qemu_id(key)
+        forms = []
+        if self.by_node:
+            forms.append((dev["node"], "device_add usb-host,hostdevice=%s,id=%s" % (dev["node"], qid)))
+        forms.append(("", "device_add usb-host,vendorid=0x%s,productid=0x%s,id=%s" % (dev["vid"], dev["pid"], qid)))
+        err = ""
+        for node, base in forms:
+            for cmd in ([base + ",bus=" + self.cfg.usb_bus, base] if self.cfg.usb_bus else [base]):
+                try:
+                    out = hmp(self.vm.monitor, cmd)
+                except HmpError as e:
+                    return "monitor: %s" % e
+                if not out:
+                    self.qdev_node[key] = node
+                    return ""
+                err = out
+                if "Bus" in out and "not found" in out:
+                    continue        # retry without an explicit bus
+                break
+            if node and "hostdevice" in err and "not found" in err:
+                # A QEMU built without it: fall back to vendor:product, which
+                # at least holds until the first replug.
+                log.warning("this QEMU has no usb-host hostdevice property; a replugged device will need Windows restarted")
+                self.by_node = False
+                continue
+            return err
         return err
 
     def qemu_remove(self, key):
@@ -1456,9 +1550,10 @@ class Daemon:
             out = hmp(self.vm.monitor, "device_del " + qemu_id(key))
         except HmpError as e:
             return "monitor: %s" % e
-        if out and "not found" in out.lower():
-            return ""
-        return out
+        if out and "not found" not in out.lower():
+            return out
+        self.qdev_node.pop(key, None)
+        return ""
 
     # -- state snapshot ----------------------------------------------------
 

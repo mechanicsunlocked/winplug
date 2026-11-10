@@ -1,10 +1,12 @@
 #!/bin/bash
 # End-to-end test of winplugd against a fake QEMU monitor, as a normal user.
 #
-# Exercises: compose patching, assign -> device_add -> attached, unplug ->
-# "unplugged" (qdev kept), replug -> attached again, a device QEMU will not
-# re-open -> recreated then reported as no-access, detach -> device_del, and a
-# stale guest device being cleaned up.  Prints PASS/FAIL per step.
+# Exercises: compose patching, assign -> device_add by node -> attached,
+# unplug -> "unplugged" (qdev kept), replug at a new node -> the empty qdev is
+# swapped for the new device, a node QEMU may not open -> no-access, a helper
+# restart with a device in Windows, detach -> device_del, a stale guest device
+# being cleaned up, and the vendor:product fallback for a QEMU without
+# hostdevice.  Prints PASS/FAIL per step.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/winplug-test.XXXXXX")
@@ -45,15 +47,22 @@ chmod 0640 "$work/docker-compose.yml"
 
 python3 "$here/fake-hmp.py" "$work/monitor.sock" "$work/ctl.sock" &
 sleep 0.3
-ctl plug 1a86:7523 >/dev/null
-ctl plug 0403:6001 >/dev/null
+ctl plug 1a86:7523 /dev/bus/usb/003/009 >/dev/null
+ctl plug 0403:6001 /dev/bus/usb/003/010 >/dev/null
+# From here on the fake QEMU is as blind as the real one in its container:
+# matching by vendor:product finds nothing that is plugged in later.
+ctl stale 1 >/dev/null
 
 export WINPLUG_SOCKET="$work/winplug.sock" WINPLUG_STATE="$work/state.json" \
     WINPLUG_MONITOR="$work/monitor.sock" WINPLUG_CONTAINER_PID=$$ WINPLUG_NO_UDEV=1 \
     WINPLUG_NO_HOME_FIX=1 WINPLUG_COMPOSE="$work/docker-compose.yml" WINPLUG_SYSFS="$work/sys" \
     WINPLUG_CONF=/nonexistent WINPLUG_AUDIT_SECONDS=4
-python3 "$here/../system/winplugd.py" 2>"$work/daemon.log" &
-for i in $(seq 1 30); do [[ -S $WINPLUG_SOCKET ]] && break; sleep 0.1; done
+start_daemon() {
+    python3 "$here/../system/winplugd.py" 2>>"$work/daemon.log" &
+    daemon_pid=$!
+    for i in $(seq 1 30); do [[ -S $WINPLUG_SOCKET ]] && break; sleep 0.1; done
+}
+start_daemon
 [[ -S $WINPLUG_SOCKET ]] && pass "daemon came up" || { flunk "daemon did not start"; cat "$work/daemon.log"; exit 1; }
 sleep 0.5
 
@@ -76,26 +85,50 @@ echo "3. attach"
 cli add 1a86:7523 | grep -q 'in Windows' && pass "add reports 'in Windows'" || flunk "add: $(cli add 1a86:7523)"
 dump | grep -q '"winplug-1a86-7523"' && pass "QEMU got device_add" || flunk "no qdev: $(dump)"
 dump | grep -q 'bus=xhci.0' && pass "attached on xhci.0" || flunk "not on xhci: $(dump)"
+qdev() { dump | python3 -c 'import json,sys; d=json.load(sys.stdin)["qdevs"].get(sys.argv[1]); print("%s %s" % (d["node"] or "by-id", "open" if d["open"] else "empty") if d else "none")' "$1"; }
+[[ $(qdev winplug-1a86-7523) == "/dev/bus/usb/003/009 open" ]] && pass "added by its device node" || flunk "qdev: $(qdev winplug-1a86-7523)"
 grep -q '"assigned": {' "$work/state.json" && grep -q '1a86:7523' "$work/state.json" && pass "assignment persisted" || flunk "state not saved"
 
 echo "4. unplug / replug"
 ctl unplug 1a86:7523 >/dev/null; rm -rf "$work/sys/3-7"
 wait_status 1a86:7523 unplugged && pass "unplug -> 'unplugged'" || flunk "after unplug: $(status_of 1a86:7523)"
-dump | grep -q '"winplug-1a86-7523"' && pass "qdev kept for QEMU's own re-attach" || flunk "qdev removed on unplug"
-mk 3-7 idVendor=1a86 idProduct=7523 bDeviceClass=ff manufacturer=QinHeng product=USB2.0-Serial busnum=3 devnum=11 speed=12
-ctl plug 1a86:7523 >/dev/null
-wait_status 1a86:7523 attached && pass "replug -> attached again (new devnum)" || flunk "after replug: $(status_of 1a86:7523)"
-
-echo "5. QEMU fails to re-open the device"
+[[ $(qdev winplug-1a86-7523) == "/dev/bus/usb/003/009 empty" ]] && pass "qdev kept while unplugged (never removed on a guess)" || flunk "qdev: $(qdev winplug-1a86-7523)"
 del_count() { dump | python3 -c 'import json,sys; print(json.load(sys.stdin)["total_del"])'; }
-ctl noaccess 1 >/dev/null
-wait_status 1a86:7523 attaching 60 && pass "goes to 'attaching' when QEMU stops holding it" || flunk "state: $(status_of 1a86:7523)"
+replug() {  # replug <devnum>: the dongle comes back at a new address, as it always does
+    mk 3-7 idVendor=1a86 idProduct=7523 bDeviceClass=ff manufacturer=QinHeng product=USB2.0-Serial busnum=3 devnum="$1" speed=12
+    ctl plug 1a86:7523 "/dev/bus/usb/003/0$1" >/dev/null
+}
 before=$(del_count)
-for i in $(seq 1 80); do (( $(del_count) > before )) && break; sleep 0.25; done
-(( $(del_count) > before )) && pass "recreated the usb-host device (device_del then re-add)" || flunk "no recreate: $(dump)"
-wait_status 1a86:7523 no-access 80 && pass "then reports no-access with a restart hint" || flunk "state: $(status_of 1a86:7523)"
+replug 11
+for i in $(seq 1 40); do [[ $(qdev winplug-1a86-7523) == "/dev/bus/usb/003/011 open" ]] && break; sleep 0.25; done
+[[ $(qdev winplug-1a86-7523) == "/dev/bus/usb/003/011 open" ]] && pass "replug -> QEMU holds the device at its new node" || flunk "qdev after replug: $(qdev winplug-1a86-7523)"
+(( $(del_count) == before + 1 )) && pass "by swapping the empty qdev, once" || flunk "device_del count went $before -> $(del_count)"
+wait_status 1a86:7523 attached && pass "and it reports 'in Windows' again" || flunk "after replug: $(status_of 1a86:7523)"
+before=$(del_count); sleep 5
+(( $(del_count) == before )) && [[ $(qdev winplug-1a86-7523) == "/dev/bus/usb/003/011 open" ]] && pass "a device in Windows is left alone" || flunk "touched an attached device: $(dump)"
+
+echo "5. QEMU may not open the replugged device (VM started without the USB rule)"
+ctl unplug 1a86:7523 >/dev/null; rm -rf "$work/sys/3-7"
+wait_status 1a86:7523 unplugged || flunk "after unplug: $(status_of 1a86:7523)"
+ctl noaccess 1 >/dev/null
+replug 12
+wait_status 1a86:7523 no-access 40 && pass "reports no-access with a restart hint" || flunk "state: $(status_of 1a86:7523)"
+cli list --json | grep -q 'restart Windows' && pass "and says to restart Windows" || flunk "no hint"
 ctl noaccess 0 >/dev/null
 wait_status 1a86:7523 attached 80 && pass "recovers when QEMU can open it again" || flunk "state: $(status_of 1a86:7523)"
+
+echo "5b. the helper is restarted while a device is in Windows (an upgrade)"
+before=$(del_count)
+kill "$daemon_pid"; wait "$daemon_pid" 2>/dev/null; rm -f "$WINPLUG_SOCKET"
+start_daemon
+wait_status 1a86:7523 attached 40 && pass "still 'in Windows' after the restart" || flunk "state: $(status_of 1a86:7523)"
+sleep 3
+(( $(del_count) == before )) && [[ $(qdev winplug-1a86-7523) == "/dev/bus/usb/003/012 open" ]] && pass "and the device was not touched" || flunk "restart disturbed the device: $(dump)"
+ctl unplug 1a86:7523 >/dev/null; rm -rf "$work/sys/3-7"
+wait_status 1a86:7523 unplugged || flunk "after unplug: $(status_of 1a86:7523)"
+replug 13
+for i in $(seq 1 40); do [[ $(qdev winplug-1a86-7523) == "/dev/bus/usb/003/013 open" ]] && break; sleep 0.25; done
+[[ $(qdev winplug-1a86-7523) == "/dev/bus/usb/003/013 open" ]] && pass "a replug after the restart is still followed (QEMU is asked for the old node)" || flunk "qdev: $(qdev winplug-1a86-7523)"
 
 echo "6. detach"
 cli remove 1a86:7523 | grep -q 'on Linux' && pass "remove reports 'on Linux'" || flunk "remove output"
@@ -131,6 +164,15 @@ a=$(add_count); sleep 6.5; b=$(add_count)
 (( $(grep -c 'device_add 0403:6001 failed' "$work/daemon.log") == 1 )) && pass "warned once" || flunk "warned $(grep -c 'device_add 0403:6001 failed' "$work/daemon.log") times"
 ctl refuse_add 0 >/dev/null
 wait_status 0403:6001 attached 80 && pass "attaches once QEMU accepts it" || flunk "state: $(status_of 0403:6001)"
+cli remove 0403:6001 >/dev/null
+
+echo "8c. a QEMU without the hostdevice property: fall back to vendor:product"
+ctl stale 0 >/dev/null; ctl unplug 0403:6001 >/dev/null; ctl plug 0403:6001 /dev/bus/usb/003/010 >/dev/null
+ctl nohostdevice 1 >/dev/null
+cli add 0403:6001 >/dev/null
+wait_status 0403:6001 attached 40 && pass "attached" || flunk "state: $(status_of 0403:6001)"
+[[ $(qdev winplug-0403-6001) == "by-id open" ]] && pass "by vendor:product" || flunk "qdev: $(qdev winplug-0403-6001)"
+(( $(grep -c 'no usb-host hostdevice property' "$work/daemon.log") == 1 )) && pass "said so once" || flunk "warned $(grep -c 'no usb-host hostdevice property' "$work/daemon.log") times"
 cli remove 0403:6001 >/dev/null
 
 echo "9. bad input"

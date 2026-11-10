@@ -197,12 +197,17 @@ nodes appear) and adds a device-cgroup rule for USB character devices
 (`c 189:* rmw`). Those are the only two lines it adds to Omarchy's compose file,
 and it re-adds them if `omarchy windows vm install` rewrites the file.
 
-**Nothing checked that QEMU actually re-attached.** QEMU matches `usb-host`
-devices by vendor and product id and rescans every two seconds, so with the
-nodes visible it usually re-attaches on its own. Winplug watches udev and, a few
-seconds after a device is back on the host but still not in the guest, tears
-the QEMU device down and recreates it. If that still fails it says so in the
-row instead of leaving you to guess.
+**QEMU never saw the replugged device.** Matched by vendor and product id, a
+`usb-host` device is looked up in libusb's device list, and inside the
+container that list is filled once, when QEMU first touches USB. libusb hears
+about later devices from udev, and no udev event reaches the container. So
+QEMU kept an empty device for the one that had been unplugged, went on
+listing it, and never opened the new one. Winplug hands QEMU the device node
+itself (`usb-host,hostdevice=/dev/bus/usb/003/009`), which needs no device
+list, watches udev on the host, and when an assigned device comes back at a
+new address it replaces QEMU's empty device with the one that is plugged in
+now. It only ever does that on evidence that QEMU's device is the old one;
+a device that is in Windows is never taken out on a guess.
 
 Devices are attached and detached live through QEMU's monitor
 (`device_add` / `device_del` on the `xhci` controller dockur creates), reached

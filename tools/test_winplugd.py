@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for the pure parts of winplugd (no root, no VM)."""
-import os, sys, json, tempfile, unittest, importlib.util, importlib.machinery, stat, socket, threading, subprocess, time, shutil
+import os, re, sys, json, tempfile, unittest, importlib.util, importlib.machinery, stat, socket, threading, subprocess, time, shutil
 
 # Never write __pycache__ into the plugin directory: Omarchy's shell reloads
 # the plugin on any file change there, and a reload while the screen is
@@ -377,6 +377,28 @@ class Launcher(unittest.TestCase):
             snap = {e["key"]: e["assigned"] for e in dm.state_message()["devices"]}
             self.assertEqual(snap.get("1a86:7523", False), "1a86:7523" in dm.store.assigned)
 
+    def test_a_deeply_nested_request_is_a_bad_request_not_a_crash(self):
+        # json.loads raises RecursionError, not ValueError, when the nesting
+        # outruns the parser's stack.  That fits under the 1 MiB line cap, and
+        # it must come back as a reply like any other malformed line.
+        with tempfile.TemporaryDirectory() as d:
+            cfg, dm = self.daemon(d)
+            c, peer = self.client(dm)
+            nested = b"[" * 300_000 + b"]" * 300_000
+            self.assertLess(len(nested) + 1, 1 << 20)
+            dm.clients[c]["buf"] = nested
+            peer.sendall(b"\n")
+            dm.read_client(c)                                    # must not raise
+            self.assertIn(c, dm.clients)
+            m = self.replies(peer)[0]
+            self.assertFalse(m["ok"])
+            self.assertTrue(m["error"].startswith("bad request:"), m["error"])
+            self.assertEqual(dm.clients[c]["buf"], b"")
+            # The daemon is still a daemon: a good request right after is served.
+            peer.sendall(b'{"cmd":"ping","id":9}\n')
+            dm.read_client(c)
+            self.assertEqual([(r["id"], r["ok"]) for r in self.replies(peer)], [(9, True)])
+
     def test_refused_add_is_retried_slowly_and_forgotten_on_detach(self):
         # After QEMU refuses a device, the daemon waits ADD_RETRY_SECONDS
         # before asking again -- but a take-back or a replug starts afresh.
@@ -441,6 +463,167 @@ class Launcher(unittest.TestCase):
             dm.store.unsaved = False
             dm.last_poll = 0; dm.reconcile()
             self.assertIn("device_del winplug-1a86-7523", sent)
+
+    # -- replug: QEMU's device is tied to one node ---------------------------
+
+    def replug_rig(self, d, drivers=("usb-storage",), devnum=9):
+        """A daemon over a fake sysfs holding one assigned stick, and a QEMU
+        that answers like the real one.  Returns (dm, q); q.sent is every
+        monitor command, q.qdevs maps qemu id -> node ("" = by vendor:product)."""
+        cfg, dm = self.daemon(d)
+        cfg.sysfs = os.path.join(d, "sys")
+        self.plug(cfg, devnum, drivers)
+        dm.store.assigned["1609:3a04"] = {"name": "stick", "added": 0}
+        class Q: pass
+        q = Q(); q.sent = []; q.qdevs = {}; q.refuse = ""; q.has_hostdevice = True; q.has_qom_get = True
+        def hmp(path, command, timeout=5.0):
+            q.sent.append(command)
+            if command == "info usb":
+                return "\n".join("  Device 0.0, Port 1, Speed 1.5 Mb/s, Product USB Host Device, ID: %s" % i for i in q.qdevs)
+            m = re.fullmatch(r"device_add usb-host,(?:hostdevice=(\S+?)|vendorid=\S+?),id=([\w-]+),bus=xhci.0", command)
+            if m:
+                if m.group(1) and not q.has_hostdevice: return "Error: Property 'usb-host.hostdevice' not found"
+                if q.refuse: return q.refuse
+                if m.group(2) in q.qdevs: return "Duplicate device ID '%s'" % m.group(2)
+                q.qdevs[m.group(2)] = m.group(1) or ""
+                return ""
+            m = re.fullmatch(r"device_del ([\w-]+)", command)
+            if m:
+                return "" if q.qdevs.pop(m.group(1), None) is not None else "Device '%s' not found" % m.group(1)
+            m = re.fullmatch(r"qom-get /machine/peripheral/([\w-]+) hostdevice", command)
+            if m:
+                return '"%s"' % q.qdevs[m.group(1)] if q.has_qom_get else "unknown command: 'qom-get'"
+            raise AssertionError("unexpected monitor command: " + command)
+        self.addCleanup(setattr, w, "hmp", w.hmp)
+        w.hmp = hmp
+        cfg.container_pid_override = str(os.getpid())
+        cfg.monitor_override = os.path.join(d, "monitor.sock")
+        open(cfg.monitor_override, "w").close()
+        dm.vm.refresh(time.monotonic())
+        return dm, q
+
+    def plug(self, cfg, devnum, drivers=("usb-storage",), name="3-3"):
+        dev = os.path.join(cfg.sysfs, name)
+        shutil.rmtree(dev, ignore_errors=True)
+        os.makedirs(dev)
+        for k, v in dict(idVendor="1609", idProduct="3a04", bDeviceClass="00", busnum="3", devnum=str(devnum)).items():
+            with open(os.path.join(dev, k), "w") as f:
+                f.write(v + "\n")
+        for n, drv in enumerate(drivers):
+            os.makedirs(os.path.join(dev, "%s:1.%d" % (name, n)))
+            os.symlink("../../drivers/" + drv, os.path.join(dev, "%s:1.%d" % (name, n), "driver"))
+
+    def changes(self, q):
+        return [c for c in q.sent if c.startswith("device_")]
+
+    def test_a_device_is_added_by_its_node(self):
+        with tempfile.TemporaryDirectory() as d:
+            dm, q = self.replug_rig(d)
+            dm.reconcile()
+            self.assertEqual(self.changes(q), ["device_add usb-host,hostdevice=/dev/bus/usb/003/009,id=winplug-1609-3a04,bus=xhci.0"])
+            dm.reconcile()
+            self.assertEqual(dm.status["1609:3a04"], "attached")
+
+    def test_a_replugged_device_is_swapped_in(self):
+        # What the real VM did: after a replug QEMU kept an empty usb-host
+        # device, `info usb` went on listing it, and the stick sat on Linux
+        # while the panel said "In Windows".
+        with tempfile.TemporaryDirectory() as d:
+            dm, q = self.replug_rig(d)
+            dm.reconcile(); dm.reconcile()
+            self.assertEqual(dm.status["1609:3a04"], "attached")
+            shutil.rmtree(os.path.join(dm.cfg.sysfs, "3-3"))
+            dm.last_poll = 0; dm.reconcile()
+            self.assertEqual(dm.status["1609:3a04"], "unplugged")
+            self.assertEqual(len(self.changes(q)), 1, "an unplugged device's qdev is not removed on a guess")
+            self.plug(dm.cfg, 10)
+            dm.reconcile()                      # no udev event, no poll due: sysfs alone shows the move
+            self.assertEqual(self.changes(q)[1:], ["device_del winplug-1609-3a04",
+                             "device_add usb-host,hostdevice=/dev/bus/usb/003/010,id=winplug-1609-3a04,bus=xhci.0"])
+            self.assertNotEqual(dm.status["1609:3a04"], "attached")
+            dm.reconcile()
+            self.assertEqual(dm.status["1609:3a04"], "attached")
+            dm.last_poll = 0; dm.reconcile(); dm.last_poll = 0; dm.reconcile()
+            self.assertEqual(len(self.changes(q)), 3, "an attached device is left alone")
+
+    def test_a_restarted_helper_asks_qemu_which_node_it_holds(self):
+        with tempfile.TemporaryDirectory() as d:
+            dm, q = self.replug_rig(d, drivers=())          # a device Linux has no driver for
+            q.qdevs["winplug-1609-3a04"] = "/dev/bus/usb/003/009"       # added by the helper's previous life
+            dm.reconcile()
+            self.assertEqual((dm.status["1609:3a04"], self.changes(q)), ("attached", []))
+            self.plug(dm.cfg, 10, drivers=())
+            dm.reconcile()
+            self.assertEqual(q.qdevs, {"winplug-1609-3a04": "/dev/bus/usb/003/010"})
+
+    def test_a_device_added_by_vendor_and_product_is_judged_by_its_drivers(self):
+        # From an older helper.  Linux drivers on the device: Windows does not
+        # have it.  usbfs, or no driver at all: leave it alone, it may be
+        # mid-flash.
+        for drivers, swapped in ((("usb-storage",), True), (("usbfs",), False), ((), False)):
+            with tempfile.TemporaryDirectory() as d:
+                dm, q = self.replug_rig(d, drivers=drivers)
+                q.qdevs["winplug-1609-3a04"] = ""
+                dm.reconcile()
+                self.assertEqual(bool(self.changes(q)), swapped, drivers)
+                if swapped:
+                    self.assertEqual(q.qdevs, {"winplug-1609-3a04": "/dev/bus/usb/003/009"})
+                else:
+                    self.assertEqual(dm.status["1609:3a04"], "attached")
+
+    def test_a_qemu_that_cannot_say_is_never_guessed_at(self):
+        with tempfile.TemporaryDirectory() as d:
+            dm, q = self.replug_rig(d, drivers=())
+            q.has_qom_get = False
+            q.qdevs["winplug-1609-3a04"] = "/dev/bus/usb/003/001"
+            dm.reconcile()
+            self.assertEqual((dm.status["1609:3a04"], self.changes(q)), ("attached", []))
+            def down(path, command, timeout=5.0):
+                if command.startswith("qom-get"): raise w.HmpError("timed out")
+                return "  Device 0.0, Port 1, Speed 1.5 Mb/s, Product USB Host Device, ID: winplug-1609-3a04"
+            dm.qdev_node.clear(); w.hmp = down
+            dm.last_poll = 0; dm.reconcile()
+            self.assertEqual(dm.status["1609:3a04"], "attached")
+            self.assertEqual(dm.qdev_node, {}, "a monitor hiccup is not an answer; ask again next time")
+
+    def test_two_identical_devices_do_not_flap(self):
+        with tempfile.TemporaryDirectory() as d:
+            dm, q = self.replug_rig(d)
+            self.plug(dm.cfg, 4, name="3-1")                 # sorts first, so it is "the" device
+            q.qdevs["winplug-1609-3a04"] = "/dev/bus/usb/003/009"       # QEMU holds the other one
+            dm.reconcile(); dm.last_poll = 0; dm.reconcile()
+            self.assertEqual((dm.status["1609:3a04"], self.changes(q)), ("attached", []))
+
+    def test_without_hostdevice_it_falls_back_to_vendor_and_product(self):
+        with tempfile.TemporaryDirectory() as d:
+            dm, q = self.replug_rig(d)
+            q.has_hostdevice = False
+            dm.reconcile()
+            self.assertEqual(q.qdevs, {"winplug-1609-3a04": ""})
+            self.assertFalse(dm.by_node)
+            dm.reconcile(); dm.last_poll = 0; dm.reconcile()
+            self.assertEqual(dm.status["1609:3a04"], "attached")
+            self.assertEqual(len(self.changes(q)), 2, "no swapping without a way to add by node")
+            # The next QEMU is asked afresh.
+            dm.audited_pid = 0; q.qdevs.clear(); q.has_hostdevice = True
+            dm.reconcile()
+            self.assertEqual(q.qdevs, {"winplug-1609-3a04": "/dev/bus/usb/003/009"})
+
+    def test_a_node_qemu_may_not_open_is_no_access(self):
+        with tempfile.TemporaryDirectory() as d:
+            dm, q = self.replug_rig(d)
+            q.refuse = "Error: Could not open '/dev/bus/usb/003/009': Operation not permitted"
+            dm.reconcile()
+            self.assertEqual(dm.status["1609:3a04"], "no-access")
+            self.assertIn("restart Windows", dm.detail["1609:3a04"])
+            dm.reconcile(); dm.reconcile()
+            self.assertEqual(len(self.changes(q)), 1, "retried slowly, not every tick")
+
+    def test_parse_qdev_node(self):
+        self.assertEqual(w.parse_qdev_node('"/dev/bus/usb/003/009"\n'), "/dev/bus/usb/003/009")
+        self.assertEqual(w.parse_qdev_node('""'), "")
+        for junk in ("", "unknown command: 'qom-get'", "Error: Device 'x' not found", '"/etc/passwd"', '"/dev/bus/usb/3/9"'):
+            self.assertIsNone(w.parse_qdev_node(junk), junk)
 
     def test_snapshot_never_takes_the_daemon_down(self):
         with tempfile.TemporaryDirectory() as d:

@@ -5,15 +5,28 @@ Speaks just enough HMP: banner + "(qemu) " prompt, QEMU's readline echo (a
 redraw of the line after every byte, escape sequences and all -- the real
 monitor does this over a socket too, and a parser that expects a clean echo
 takes a successful device_add for an error), `info usb`,
-`device_add usb-host,...`, `device_del <id>`.  A usb-host device
-counts as attached to the guest only while a matching device exists in the
-fake host list, which is controlled through a side channel:
+`device_add usb-host,...`, `device_del <id>`, `qom-get <path> hostdevice`.
+
+usb-host devices behave like QEMU's, as seen on a real VM:
+
+  * added with hostdevice=<node>, the device is opened there and then, or the
+    add fails.  Once its host device goes away it is an empty shell: it keeps
+    its id and its line in `info usb`, and never opens anything again.
+  * added with vendorid/productid, it holds the matching host device while
+    one is plugged in and QEMU can see it.  A real QEMU inside the container
+    sees only what was plugged in when it first touched USB; `stale 1` turns
+    that blindness on, and it is off by default.
+  * `info usb` lists every usb-host device, holding something or not.
+
+The host side is controlled through a side channel:
 
     fake-hmp.py <monitor.sock> <control.sock>
 
-    echo 'plug 1a86:7523'   | nc -U control.sock
+    echo 'plug 1a86:7523 /dev/bus/usb/003/009' | nc -U control.sock
     echo 'unplug 1a86:7523' | nc -U control.sock
-    echo 'noaccess 1'       | nc -U control.sock   # libusb_open fails: never attaches
+    echo 'noaccess 1'       | nc -U control.sock   # QEMU may not open device nodes
+    echo 'nohostdevice 1'   | nc -U control.sock   # a QEMU without the hostdevice property
+    echo 'stale 1'          | nc -U control.sock   # vendorid matching no longer sees new plugs
     echo 'dump'             | nc -U control.sock
 
 Handles one monitor client at a time, like QEMU."""
@@ -26,49 +39,80 @@ for p in (mon_path, ctl_path):
 mon = socket.socket(socket.AF_UNIX); mon.bind(mon_path); mon.listen(4)
 ctl = socket.socket(socket.AF_UNIX); ctl.bind(ctl_path); ctl.listen(4)
 
-host = set()               # vid:pid present on the "host"
-qdevs = {}                 # id -> {"vid","pid","bus"}
+host = {}                  # vid:pid -> device node of what is plugged into the "host"
+seen = set()               # vid:pid that vendorid matching can see (everything, unless stale)
+qdevs = {}                 # id -> {"vid","pid","bus","node","open"}; node "" = added by vendorid
 no_access = False
+no_hostdevice = False
+stale = False
 refuse_add = False         # device_add fails outright (libusb could not open the device, say)
 log = []
 
 def attached_ids():
-    if no_access: return []
-    return [i for i, d in qdevs.items() if d["vid"] + ":" + d["pid"] in host]
+    return [i for i, d in qdevs.items() if d["open"]]
+
+def rescan():
+    """QEMU's two-second auto-scan, for the devices added by vendorid."""
+    for d in qdevs.values():
+        if not d["node"]:
+            key = d["vid"] + ":" + d["pid"]
+            d["open"] = key in host and key in seen and not no_access
 
 def run(cmd):
     log.append(cmd)
     cmd = cmd.strip()
     if cmd == "info usb":
         out = ""
-        for n, i in enumerate(attached_ids()):
-            d = qdevs[i]
-            out += "  Device 0.%d, Port %d, Speed 480 Mb/s, Product Fake %s:%s, ID: %s\n" % (n + 1, n + 1, d["vid"], d["pid"], i)
+        for n, (i, d) in enumerate(qdevs.items()):
+            if d["open"]:
+                out += "  Device 0.%d, Port %d, Speed 480 Mb/s, Product Fake %s:%s, ID: %s\n" % (n + 1, n + 1, d["vid"], d["pid"], i)
+            else:
+                out += "  Device 0.0, Port %d, Speed 1.5 Mb/s, Product USB Host Device, ID: %s\n" % (n + 1, i)
         return out
-    m = re.fullmatch(r"device_add usb-host,vendorid=0x([0-9a-f]{4}),productid=0x([0-9a-f]{4}),id=([\w.-]+)(?:,bus=([\w.-]+))?", cmd)
+    m = re.fullmatch(r"device_add usb-host,(?:hostdevice=(\S+?)|vendorid=0x([0-9a-f]{4}),productid=0x([0-9a-f]{4})),id=([\w.-]+)(?:,bus=([\w.-]+))?", cmd)
     if m:
-        vid, pid, i, bus = m.groups()
+        node, vid, pid, i, bus = m.groups()
+        if node and no_hostdevice: return "Error: Property 'usb-host.hostdevice' not found\n"
         if i in qdevs: return "Duplicate device ID '%s'\n" % i
         if bus and bus != "xhci.0": return "Bus '%s' not found\n" % bus
         if refuse_add: return "Error: USB device not found or cannot be opened\n"
-        qdevs[i] = {"vid": vid, "pid": pid, "bus": bus}
+        if node:
+            key = next((k for k, n in host.items() if n == node), None)
+            if key is None: return "Error: Could not open '%s': No such file or directory\n" % node
+            if no_access: return "Error: Could not open '%s': Operation not permitted\n" % node
+            vid, pid = key.split(":")
+        qdevs[i] = {"vid": vid, "pid": pid, "bus": bus, "node": node or "", "open": bool(node)}
+        rescan()
         return ""
     m = re.fullmatch(r"device_del ([\w.-]+)", cmd)
     if m:
         if m.group(1) not in qdevs: return "Device '%s' not found\n" % m.group(1)
         del qdevs[m.group(1)]
         return ""
+    m = re.fullmatch(r"qom-get /machine/peripheral/([\w.-]+) hostdevice", cmd)
+    if m:
+        if m.group(1) not in qdevs: return "Error: Device '/machine/peripheral/%s' not found\n" % m.group(1)
+        return '"%s"\n' % qdevs[m.group(1)]["node"]
     return "unknown command: '%s'\n" % cmd
 
 def control(line):
-    global no_access, refuse_add
+    global no_access, no_hostdevice, stale, refuse_add
     parts = line.split()
     if not parts: return ""
-    if parts[0] == "plug": host.add(parts[1]); return "ok\n"
-    if parts[0] == "unplug": host.discard(parts[1]); return "ok\n"
-    if parts[0] == "noaccess": no_access = parts[1] == "1"; return "ok\n"
+    if parts[0] == "plug":
+        host[parts[1]] = parts[2]
+        if not stale: seen.add(parts[1])
+        rescan(); return "ok\n"
+    if parts[0] == "unplug":
+        node = host.pop(parts[1], None); seen.discard(parts[1])
+        for d in qdevs.values():
+            if d["node"] == node: d["open"] = False      # for good: the node is gone
+        rescan(); return "ok\n"
+    if parts[0] == "noaccess": no_access = parts[1] == "1"; rescan(); return "ok\n"
+    if parts[0] == "nohostdevice": no_hostdevice = parts[1] == "1"; return "ok\n"
+    if parts[0] == "stale": stale = parts[1] == "1"; return "ok\n"
     if parts[0] == "refuse_add": refuse_add = parts[1] == "1"; return "ok\n"
-    if parts[0] == "dump": return json.dumps({"host": sorted(host), "qdevs": qdevs, "attached": attached_ids(), "log": log[-20:], "total": len(log),
+    if parts[0] == "dump": return json.dumps({"host": host, "qdevs": qdevs, "attached": attached_ids(), "log": log[-20:], "total": len(log),
                                               "total_del": sum(1 for c in log if c.strip().startswith("device_del")),
                                               "total_add": sum(1 for c in log if c.strip().startswith("device_add"))}) + "\n"
     return "?\n"
